@@ -1,0 +1,863 @@
+import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets
+from collections import deque
+from pathlib import Path
+from typing import Optional, List
+from urllib.parse import urlsplit
+import pyotp, jwt, httpx
+from ruamel.yaml import YAML
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from pyrogram import Client
+from pyrogram.enums import ChatType
+from pyrogram.errors import SessionPasswordNeeded
+
+app = FastAPI(title="TG Media Downloader Pro Panel")
+yaml = YAML()
+yaml.preserve_quotes = True
+
+CONFIG_PATH = Path("/app/config_store/config.yaml")
+ENGINE_CONFIG_LINK = Path("/app/config.yaml")
+SESSION_STORE_DIR = Path("/app/sessions")
+SESSION_NAME = "media_downloader"
+RCLONE_CONF_PATH = Path("/root/.config/rclone/rclone.conf")
+RCLONE_BIN = "/app/rclone/rclone"
+
+JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
+OTP_SECRET = os.getenv("OTP_SECRET") or pyotp.random_base32()
+
+ALLOWED_STORAGE_TYPES = {"infinicloud", "webdav", "smb", "tgfs"}
+
+# 引擎分组运行状态
+downloader_proc: Optional[subprocess.Popen] = None
+engine_thread: Optional[threading.Thread] = None
+stop_event = threading.Event()
+pending_auth = {"client": None, "phone": None, "phone_code_hash": None}
+
+engine_logs = deque(maxlen=500)
+session_stats = {"downloaded_count": 0, "last_file": "", "start_time": 0}
+
+# ==================== 初始化 ====================
+
+def sync_session_files():
+    SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    app_sess = Path(f"/app/{SESSION_NAME}.session")
+    store_sess = SESSION_STORE_DIR / f"{SESSION_NAME}.session"
+    if store_sess.exists() and not app_sess.exists():
+        app_sess.symlink_to(store_sess)
+    elif app_sess.exists() and not app_sess.is_symlink():
+        shutil.move(str(app_sess), str(store_sess))
+        app_sess.symlink_to(store_sess)
+
+def init_env():
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    sync_session_files()
+    if not CONFIG_PATH.exists():
+        default_cfg = {
+            "api_id": 123456,
+            "api_hash": "",
+            "media_types": ["photo", "video"],
+            "file_formats": {"video": ["all"], "audio": ["all"], "document": ["all"]},
+            "save_path": "/app/save",
+            "file_path_prefix": ["chat_title", "media_datetime"],
+            "language": "ZH",
+            "web_host": "0.0.0.0",
+            "web_port": 5000,
+            "chat": []
+        }
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            yaml.dump(default_cfg, f)
+    if ENGINE_CONFIG_LINK.exists() or ENGINE_CONFIG_LINK.is_symlink():
+        ENGINE_CONFIG_LINK.unlink()
+    ENGINE_CONFIG_LINK.symlink_to(CONFIG_PATH)
+
+init_env()
+totp = pyotp.TOTP(OTP_SECRET)
+# 安全：不在容器日志中输出 OTP 密钥 / provisioning URI（见设计文档 §2）
+print("\n========== [安全中心] ==========")
+print("OTP 密钥由环境变量 OTP_SECRET 提供（日志不回显明文）")
+print("如需重置，请修改 docker-compose.yml 后重建容器")
+print("================================\n")
+
+# 前端依赖本地化：避免 CDN 不可达导致 Vue 未挂载、页面只剩背景色
+VENDOR_DIR = Path("/app/templates/vendor")
+if VENDOR_DIR.exists():
+    app.mount("/vendor", StaticFiles(directory=str(VENDOR_DIR)), name="vendor")
+
+# ==================== 配置读写 ====================
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.load(f) or {}
+
+def dump_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f)
+
+def link_engine_config(target: Path):
+    """把 /app/config.yaml 指向指定配置文件（引擎按相对路径读取此文件）"""
+    if ENGINE_CONFIG_LINK.exists() or ENGINE_CONFIG_LINK.is_symlink():
+        ENGINE_CONFIG_LINK.unlink()
+    ENGINE_CONFIG_LINK.symlink_to(target)
+
+# ==================== 多网盘管理 ====================
+
+def normalize_tgfs_webdav_url(raw: str) -> str:
+    """TGFS：仅接受显式提供的受控 WebDAV URL，不静默猜测公网域名。
+
+    遵循设计文档 §5.2：必须完整 http(s)://host:port/path；URL 内不得夹带
+    账户/密码/查询串/片段；明文 HTTP 仅允许内网地址或名为 tgfs 的内部服务。
+    """
+    url = (raw or "").strip().rstrip("/")
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("TGFS 需要完整的 http(s)://host:port/webdav 地址")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("URL 不得包含账户、密码、查询串或片段")
+
+    def _is_private_host(host: str) -> bool:
+        if host in {"localhost", "tgfs", "127.0.0.1", "::1"}:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_private
+        except ValueError:
+            return host.endswith(".local") or host.endswith(".internal")
+
+    if parsed.scheme == "http" and not _is_private_host(parsed.hostname):
+        raise ValueError("公网地址必须使用 HTTPS；HTTP 仅限内网 TGFS 服务")
+    return url
+
+
+def normalize_storage_url(stype: str, host_val: str) -> str:
+    host_val = (host_val or "").strip().rstrip("/")
+    if not host_val:
+        return ""
+    if stype == "tgfs":
+        return normalize_tgfs_webdav_url(host_val)
+    if stype == "infinicloud":
+        if not host_val.startswith("http"):
+            host_val = f"https://{host_val}.teracloud.jp" if "." not in host_val else f"https://{host_val}"
+        if not host_val.endswith("/dav"):
+            host_val += "/dav"
+        host_val += "/"
+    elif stype == "webdav":
+        if not host_val.startswith("http"):
+            host_val = f"https://{host_val}"
+        if not host_val.endswith("/"):
+            host_val += "/"
+    return host_val
+
+def encrypt_rclone_pass(plain: str) -> str:
+    if not plain:
+        return ""
+    try:
+        res = subprocess.run([RCLONE_BIN, "obscure", plain], capture_output=True, text=True)
+        return res.stdout.strip()
+    except Exception as e:
+        print(f"[rclone obscure error] {e}")
+        return ""
+
+def get_existing_rclone_passes() -> dict:
+    if not RCLONE_CONF_PATH.exists():
+        return {}
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(RCLONE_CONF_PATH, encoding="utf-8")
+    except Exception:
+        return {}
+    return {sec: cp[sec]["pass"] for sec in cp.sections() if cp.has_option(sec, "pass")}
+
+def remote_name_of(sid: str) -> str:
+    return f"remote_{sid}" if sid else "tg_remote"
+
+def write_rclone_conf(storages: list):
+    """根据多网盘配置重建 rclone.conf（每个网盘一个独立 remote）"""
+    lines = []
+    existing_passes = get_existing_rclone_passes()
+    for s in storages:
+        sid = s.get("id", "")
+        rname = remote_name_of(sid)
+        stype = s.get("type", "webdav")
+        url = s.get("url", "")
+        user = s.get("user", "")
+        plain_pass = s.get("_plain_pass", "") or s.get("pass", "")
+        obs_pass = encrypt_rclone_pass(plain_pass) if plain_pass else existing_passes.get(rname, "")
+        # TGFS 仍走 Rclone 的 webdav 后端（不存在 tgfs 驱动），且凭据必须齐全
+        if stype == "tgfs":
+            if not url or not user.strip() or not obs_pass.strip():
+                raise ValueError(f"TGFS 网盘「{s.get('name', sid)}」需填写完整的 WebDAV 地址、用户名和密码")
+            if "\n" in user or "\r" in user:
+                raise ValueError("TGFS WebDAV 用户名非法")
+        lines.append(f"[{rname}]")
+        if stype in ("infinicloud", "webdav", "tgfs"):
+            lines.append("type = webdav")
+            lines.append(f"url = {url}")
+            lines.append("vendor = other")
+        elif stype == "smb":
+            lines.append("type = smb")
+            lines.append(f"host = {url}")
+        else:
+            lines.append("type = webdav")
+            lines.append(f"url = {url}")
+            lines.append("vendor = other")
+        lines.append(f"user = {user}")
+        lines.append(f"pass = {obs_pass}")
+        lines.append("")
+    RCLONE_CONF_PATH.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        os.chmod(RCLONE_CONF_PATH, 0o600)
+    except OSError:
+        pass
+
+def get_all_rclone_quotas() -> list:
+    if not RCLONE_CONF_PATH.exists():
+        return []
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(RCLONE_CONF_PATH, encoding="utf-8")
+    except Exception:
+        return []
+    quotas = []
+    tgfs_remotes = {
+        remote_name_of(s.get("id", ""))
+        for s in load_config().get("_ui_storages", [])
+        if s.get("type") == "tgfs"
+    }
+    for sec in cp.sections():
+        # TGFS 的 WebDAV 桥接不一定实现标准容量接口，按文档要求明示「未知」
+        if sec in tgfs_remotes:
+            quotas.append({"remote": sec, "info": "未知（TGFS 无标准容量接口）"})
+            continue
+        try:
+            res = subprocess.run([RCLONE_BIN, "about", f"{sec}:", "--timeout", "8s"], capture_output=True, text=True)
+            info = res.stdout.strip().replace("\n", " | ") if res.returncode == 0 and res.stdout.strip() else "未知"
+        except Exception:
+            info = "未知"
+        quotas.append({"remote": sec, "info": info})
+    return quotas
+
+def get_rclone_quota_summary() -> str:
+    quotas = get_all_rclone_quotas()
+    if not quotas:
+        return "未配置网盘"
+    return " | ".join(f"{q['remote']}: {q['info']}" for q in quotas)
+
+# ==================== 引擎分组运行（多网盘路由核心） ====================
+# 关键事实：telegram_media_downloader 引擎只在启动时从全局 config.yaml 读取
+# 一次 upload_drive（module/app.py -> self.cloud_drive_config 单例），不支持
+# 频道级覆盖。因此这里按「频道 -> 网盘」分组，串行生成每组的临时 config，
+# 逐组启动引擎；每组结束后把更新后的水位线回写主配置。
+
+def build_groups(cfg):
+    storages = {s["id"]: s for s in cfg.get("_ui_storages", [])}
+    groups = {}
+    for c in cfg.get("chat", []):
+        sid = c.get("_storage_id", "")
+        if sid not in storages:
+            sid = ""
+        # 双保险：未经显式授权的 TGFS 绝不参与自动上传，降级为本地存储
+        if sid and storages[sid].get("type") == "tgfs" and not storages[sid].get("upload_authorized"):
+            engine_logs.append(
+                f"[{time.strftime('%H:%M:%S')}] ⚠ 频道 {c.get('chat_id')} 指向未授权的 TGFS，本轮改存本地"
+            )
+            sid = ""
+        groups.setdefault(sid, []).append(c)
+    return storages, groups
+
+def make_upload_drive(storage, delete_after: bool) -> dict:
+    if not storage:
+        return {"enable_upload_file": False}
+    rname = remote_name_of(storage.get("id", ""))
+    return {
+        "enable_upload_file": True,
+        "remote_dir": f"{rname}:{storage.get('remote_dir', 'tg_backup')}",
+        "upload_adapter": "rclone",
+        "rclone_path": RCLONE_BIN,
+        "before_upload_file_zip": False,
+        "after_upload_file_delete": delete_after,
+    }
+
+def clean_chat_for_engine(c) -> dict:
+    return {
+        "chat_id": c.get("chat_id"),
+        "last_read_message_id": int(c.get("last_read_message_id", 0)),
+    }
+
+def strip_ui_keys(cfg) -> dict:
+    return {k: v for k, v in cfg.items() if not k.startswith("_ui_")}
+
+def run_all_groups():
+    """按网盘分组串行运行下载引擎，实现真正的频道级存储路由"""
+    global downloader_proc
+    try:
+        cfg = load_config()
+        storages, groups = build_groups(cfg)
+        if not groups:
+            engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 未配置任何频道，任务跳过")
+            return
+
+        delete_after = cfg.get("_ui_delete_after_upload", False)
+        total = len(groups)
+        engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 📋 共 {total} 个存储分组，将依次归档")
+
+        for idx, (sid, chats) in enumerate(groups.items()):
+            if stop_event.is_set():
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⏹ 收到停止信号，中止后续分组")
+                break
+
+            label = storages[sid].get("name", sid) if sid else "本地存储"
+            engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ▶ [{idx+1}/{total}] {label} · {len(chats)} 个频道")
+
+            # 每组生成独立 config，避免私有字段污染引擎
+            run_cfg = strip_ui_keys(load_config())
+            run_cfg["chat"] = [clean_chat_for_engine(c) for c in chats]
+            run_cfg["upload_drive"] = make_upload_drive(storages.get(sid), delete_after)
+            run_cfg.pop("_ui_delete_after_upload", None)
+
+            tmp = Path(f"/app/config_store/_run_group_{idx}.yaml")
+            with open(tmp, "w", encoding="utf-8") as f:
+                yaml.dump(run_cfg, f)
+            link_engine_config(tmp)
+
+            proc = subprocess.Popen(
+                ["python3", "-u", "media_downloader.py"], cwd="/app",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+            )
+            downloader_proc = proc
+            for raw_line in iter(proc.stdout.readline, ""):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+                if any(k in line.lower() for k in ["successfully downloaded", "下载成功", "成功下载", "upload file"]):
+                    session_stats["downloaded_count"] += 1
+            proc.wait()
+
+            # 回写本组频道的水位线到主配置
+            try:
+                with open(tmp, "r", encoding="utf-8") as f:
+                    updated = yaml.load(f) or {}
+                id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0)) for u in updated.get("chat", [])}
+                main_cfg = load_config()
+                for c in main_cfg.get("chat", []):
+                    key = str(c.get("chat_id"))
+                    if key in id_map:
+                        c["last_read_message_id"] = id_map[key]
+                dump_config(main_cfg)
+            except Exception as e:
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 水位线回写失败: {e}")
+            finally:
+                downloader_proc = None
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ [{idx+1}/{total}] {label} 完成")
+
+        # 恢复引擎 config 指向主配置
+        link_engine_config(CONFIG_PATH)
+
+        elapsed = round(time.time() - session_stats["start_time"], 1)
+        engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 🏁 全部任务结束 (耗时 {elapsed}s)")
+
+        # 任务完成通知
+        notify_cfg = load_config().get("_ui_notify", {})
+        if notify_cfg.get("notify_on_task_finish", True) and elapsed > 2:
+            latest = load_config()
+            title_map = latest.get("_ui_chat_titles", {})
+            storage_names = {s["id"]: s.get("name", s["id"]) for s in latest.get("_ui_storages", [])}
+            chat_lines = []
+            for c in latest.get("chat", []):
+                sid = c.get("_storage_id", "")
+                target = storage_names.get(sid, "本地存储") if sid else "本地存储"
+                chat_lines.append(f"• {title_map.get(str(c['chat_id']), c['chat_id'])} → {target}")
+            send_notification(
+                "TG 媒体归档与同步完成",
+                [
+                    f"**本轮处理文件数**：`{session_stats['downloaded_count']}` 项",
+                    f"**总耗时**：`{elapsed}` 秒",
+                    f"**归档结构**：`频道名称 / 月份(YYYY-MM)`",
+                    "\n".join(chat_lines) if chat_lines else "**频道**：无",
+                    f"**网盘状态**：`{get_rclone_quota_summary()}`"
+                ]
+            )
+    finally:
+        downloader_proc = None
+        link_engine_config(CONFIG_PATH)
+
+# ==================== 通知 ====================
+
+def send_notification(title: str, content_lines: List[str]) -> dict:
+    cfg = load_config()
+    notify = cfg.get("_ui_notify", {})
+    results = {}
+
+    if notify.get("feishu_enable") and notify.get("feishu_webhook"):
+        webhook = notify["feishu_webhook"].strip()
+        secret = notify.get("feishu_secret", "").strip()
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"tag": "plain_text", "content": f"🚀 {title}"}, "template": "blue"},
+                "elements": [
+                    {"tag": "markdown", "content": "\n".join(content_lines)},
+                    {"tag": "hr"},
+                    {"tag": "note", "elements": [{"tag": "plain_text", "content": f"推送时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"}]}
+                ]
+            }
+        }
+        if secret:
+            ts = str(int(time.time()))
+            sig_str = f"{ts}\n{secret}"
+            hmac_code = hmac.new(sig_str.encode("utf-8"), digestmod=hashlib.sha256).digest()
+            payload["timestamp"] = ts
+            payload["sign"] = base64.b64encode(hmac_code).decode("utf-8")
+        try:
+            r = httpx.post(webhook, json=payload, timeout=10.0)
+            results["feishu"] = r.json()
+        except Exception as e:
+            results["feishu"] = str(e)
+
+    if notify.get("tgbot_enable") and notify.get("tgbot_token") and notify.get("tgbot_chat_id"):
+        token = notify["tgbot_token"].strip()
+        chat_id = notify["tgbot_chat_id"].strip()
+        proxy_cfg = cfg.get("proxy")
+        proxy_url = None
+        if proxy_cfg and proxy_cfg.get("hostname") and proxy_cfg.get("port"):
+            scheme = proxy_cfg.get("scheme", "socks5")
+            auth = f"{proxy_cfg['username']}:{proxy_cfg['password']}@" if proxy_cfg.get("username") else ""
+            proxy_url = f"{scheme}://{auth}{proxy_cfg['hostname']}:{proxy_cfg['port']}"
+        text_msg = f"🚀 *{title}*\n\n" + "\n".join(content_lines)
+        try:
+            with httpx.Client(proxy=proxy_url, timeout=12.0) as client:
+                r = client.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text_msg, "parse_mode": "Markdown"})
+                results["tgbot"] = r.json()
+        except Exception as e:
+            results["tgbot"] = str(e)
+    return results
+
+# ==================== 鉴权 ====================
+
+def verify_auth(request: Request):
+    token = request.cookies.get("tg_device_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录")
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        raise HTTPException(status_code=401, detail="凭证无效")
+
+class LoginReq(BaseModel):
+    otp_code: str
+    remember_30d: bool = True
+
+@app.post("/api/login")
+def login(req: LoginReq, response: Response):
+    if not totp.verify(req.otp_code, valid_window=1):
+        raise HTTPException(status_code=403, detail="OTP 错误")
+    token = jwt.encode({"exp": time.time() + (30*86400 if req.remember_30d else 86400), "sub": "admin"}, JWT_SECRET, algorithm="HS256")
+    response.set_cookie(key="tg_device_token", value=token, max_age=30*86400, httponly=True, samesite="lax")
+    return {"status": "ok"}
+
+@app.post("/api/logout")
+def logout(response: Response):
+    response.delete_cookie("tg_device_token")
+    return {"status": "ok"}
+
+# ==================== TG 客户端 ====================
+
+def build_pyrogram_client() -> Client:
+    cfg = load_config()
+    return Client(name=SESSION_NAME, api_id=int(cfg["api_id"]), api_hash=str(cfg["api_hash"]), workdir=str(SESSION_STORE_DIR), proxy=cfg.get("proxy"))
+
+@app.get("/api/tg/status", dependencies=[Depends(verify_auth)])
+async def tg_status():
+    if not (SESSION_STORE_DIR / f"{SESSION_NAME}.session").exists():
+        return {"logged_in": False}
+    if engine_thread and engine_thread.is_alive():
+        return {"logged_in": True, "engine_busy": True}
+    client = build_pyrogram_client()
+    try:
+        await client.connect()
+        me = await client.get_me()
+        return {"logged_in": True, "user": {"name": f"{me.first_name} {me.last_name or ''}".strip(), "id": me.id}}
+    except Exception:
+        return {"logged_in": False}
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+class SendCodeReq(BaseModel):
+    api_id: int
+    api_hash: str
+    phone: str
+
+@app.post("/api/tg/send_code", dependencies=[Depends(verify_auth)])
+async def tg_send_code(req: SendCodeReq):
+    cfg = load_config()
+    cfg["api_id"], cfg["api_hash"] = req.api_id, req.api_hash.strip()
+    dump_config(cfg)
+    if pending_auth["client"]:
+        try:
+            await pending_auth["client"].disconnect()
+        except Exception:
+            pass
+    client = build_pyrogram_client()
+    await client.connect()
+    sent = await client.send_code(req.phone.strip())
+    pending_auth.update({"client": client, "phone": req.phone.strip(), "phone_code_hash": sent.phone_code_hash})
+    return {"ok": True, "msg": "验证码已发送"}
+
+class VerifyCodeReq(BaseModel):
+    code: str = ""
+    password: str = ""
+
+@app.post("/api/tg/verify_code", dependencies=[Depends(verify_auth)])
+async def tg_verify_code(req: VerifyCodeReq):
+    client = pending_auth.get("client")
+    if not client:
+        raise HTTPException(status_code=400, detail="会话超时")
+    try:
+        if req.code:
+            try:
+                await client.sign_in(pending_auth["phone"], pending_auth["phone_code_hash"], req.code.strip())
+            except SessionPasswordNeeded:
+                if not req.password:
+                    return {"ok": False, "need_2fa": True, "msg": "请输入两步验证密码"}
+                await client.check_password(req.password)
+        elif req.password:
+            await client.check_password(req.password)
+        me = await client.get_me()
+        await client.disconnect()
+        pending_auth["client"] = None
+        sync_session_files()
+        return {"ok": True, "user": {"name": me.first_name}}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/tg/dialogs", dependencies=[Depends(verify_auth)])
+async def tg_list_dialogs():
+    client = build_pyrogram_client()
+    dialogs = []
+    try:
+        await client.connect()
+        async for d in client.get_dialogs():
+            if d.chat.type in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
+                dialogs.append({"chat_id": d.chat.id, "title": d.chat.title or "未命名", "username": d.chat.username or "", "type": "频道" if d.chat.type == ChatType.CHANNEL else "群组"})
+        return {"ok": True, "dialogs": dialogs}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+# ==================== 配置 API ====================
+
+class ConfigPayload(BaseModel):
+    api_id: int
+    api_hash: str
+    save_path: str
+    file_path_prefix: List[str] = ["chat_title", "media_datetime"]
+    media_types: List[str] = ["photo", "video"]
+    proxy_enable: bool = False
+    proxy_scheme: str = "socks5"
+    proxy_host: str = "127.0.0.1"
+    proxy_port: int = 7890
+    proxy_user: str = ""
+    proxy_pass: str = ""
+    chats: List[dict] = []
+    storages: List[dict] = []
+    delete_after_upload: bool = False
+    feishu_enable: bool = False
+    feishu_webhook: str = ""
+    feishu_secret: str = ""
+    tgbot_enable: bool = False
+    tgbot_token: str = ""
+    tgbot_chat_id: str = ""
+    notify_on_task_finish: bool = True
+    notify_on_each_file: bool = False
+
+@app.get("/api/config", dependencies=[Depends(verify_auth)])
+def get_config():
+    cfg = load_config()
+    proxy, notify = cfg.get("proxy", {}), cfg.get("_ui_notify", {})
+    title_map = cfg.get("_ui_chat_titles", {})
+    existing_passes = get_existing_rclone_passes()
+
+    chats_out = [{
+        "chat_id": c.get("chat_id"),
+        "title": title_map.get(str(c.get("chat_id")), ""),
+        "last_read_message_id": c.get("last_read_message_id", 0),
+        "storage_id": c.get("_storage_id", ""),
+    } for c in cfg.get("chat", [])]
+
+    storages_out = [{
+        "id": s.get("id", ""),
+        "name": s.get("name", ""),
+        "type": s.get("type", "webdav"),
+        "url": s.get("url", ""),
+        "user": s.get("user", ""),
+        "has_pass": bool(existing_passes.get(remote_name_of(s.get("id", "")))),
+        "remote_dir": s.get("remote_dir", "tg_backup"),
+        "upload_authorized": bool(s.get("upload_authorized", False)) if s.get("type") == "tgfs" else True,
+    } for s in cfg.get("_ui_storages", [])]
+
+    return {
+        "api_id": cfg.get("api_id", 123456), "api_hash": cfg.get("api_hash", ""),
+        "save_path": cfg.get("save_path", "/app/save"),
+        "file_path_prefix": cfg.get("file_path_prefix", ["chat_title", "media_datetime"]),
+        "media_types": cfg.get("media_types", ["photo", "video"]),
+        "proxy_enable": bool(proxy), "proxy_scheme": proxy.get("scheme", "socks5"),
+        "proxy_host": proxy.get("hostname", "127.0.0.1"), "proxy_port": proxy.get("port", 7890),
+        "proxy_user": proxy.get("username", ""), "proxy_pass": proxy.get("password", ""),
+        "chats": chats_out, "storages": storages_out,
+        "delete_after_upload": cfg.get("_ui_delete_after_upload", False),
+        "feishu_enable": notify.get("feishu_enable", False), "feishu_webhook": notify.get("feishu_webhook", ""),
+        "feishu_secret": notify.get("feishu_secret", ""), "tgbot_enable": notify.get("tgbot_enable", False),
+        "tgbot_token": notify.get("tgbot_token", ""), "tgbot_chat_id": notify.get("tgbot_chat_id", ""),
+        "notify_on_task_finish": notify.get("notify_on_task_finish", True),
+        "notify_on_each_file": notify.get("notify_on_each_file", False),
+        "running": bool(engine_thread and engine_thread.is_alive()),
+    }
+
+@app.post("/api/config", dependencies=[Depends(verify_auth)])
+def save_config(payload: ConfigPayload):
+    cfg = load_config()
+    cfg["api_id"], cfg["api_hash"] = payload.api_id, payload.api_hash.strip()
+    cfg["save_path"], cfg["media_types"] = payload.save_path, payload.media_types
+    cfg["file_path_prefix"] = ["chat_title", "media_datetime"]
+
+    # --- 多网盘（含 TGFS）---
+    clean_storages = []
+    for s in payload.storages:
+        sid = s.get("id", "") or str(uuid.uuid4())[:8]
+        stype = s.get("type", "webdav")
+        if stype not in ALLOWED_STORAGE_TYPES:
+            raise HTTPException(status_code=422, detail=f"不支持的存储类型: {stype}")
+        try:
+            url = normalize_storage_url(stype, s.get("url", ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"网盘「{s.get('name') or sid}」：{exc}") from exc
+        clean_storages.append({
+            "id": sid,
+            "name": s.get("name", "").strip() or f"网盘_{sid[:4]}",
+            "type": stype,
+            "url": url,
+            "user": s.get("user", ""),
+            "remote_dir": (s.get("remote_dir", "") or "tg_backup").strip("/") or "tg_backup",
+            # TGFS 默认关闭自动上传，必须由用户显式勾选授权（设计文档 §5.3）
+            "upload_authorized": bool(s.get("upload_authorized", False)) if stype == "tgfs" else True,
+            "_plain_pass": s.get("pass", ""),
+        })
+    try:
+        write_rclone_conf(clean_storages)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    cfg["_ui_storages"] = [{k: v for k, v in s.items() if k != "_plain_pass"} for s in clean_storages]
+    cfg["_ui_delete_after_upload"] = payload.delete_after_upload
+
+    # --- 频道 + 存储路由 ---
+    clean_chats, title_map = [], {}
+    storage_by_id = {s["id"]: s for s in clean_storages}
+    for c in payload.chats:
+        cid_raw = str(c.get("chat_id", "")).strip()
+        if cid_raw == "":
+            continue
+        cid = int(cid_raw) if cid_raw.lstrip("-").isdigit() else cid_raw
+        sid = c.get("storage_id", "")
+        if sid and sid not in storage_by_id:
+            sid = ""
+        if sid:
+            target = storage_by_id[sid]
+            if target["type"] == "tgfs" and not target["upload_authorized"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"频道 {c.get('title') or cid} 指向未授权的 TGFS「{target['name']}」。"
+                           "请先在网盘设置中勾选上传授权，或改选其它存储目标。"
+                )
+        entry = {"chat_id": cid, "last_read_message_id": int(c.get("last_read_message_id", 0))}
+        if sid:
+            entry["_storage_id"] = sid
+        clean_chats.append(entry)
+        if c.get("title"):
+            title_map[str(cid)] = c["title"]
+    cfg["chat"], cfg["_ui_chat_titles"] = clean_chats, title_map
+
+    # --- 代理 ---
+    if payload.proxy_enable:
+        cfg["proxy"] = {
+            "scheme": payload.proxy_scheme, "hostname": payload.proxy_host,
+            "port": int(payload.proxy_port),
+            **({"username": payload.proxy_user, "password": payload.proxy_pass} if payload.proxy_user else {})
+        }
+    elif "proxy" in cfg:
+        del cfg["proxy"]
+
+    # 引擎运行时的 upload_drive 由分组逻辑按组动态生成，这里只留一个静态兜底
+    cfg["upload_drive"] = {"enable_upload_file": False}
+
+    cfg["_ui_notify"] = {
+        "feishu_enable": payload.feishu_enable, "feishu_webhook": payload.feishu_webhook,
+        "feishu_secret": payload.feishu_secret, "tgbot_enable": payload.tgbot_enable,
+        "tgbot_token": payload.tgbot_token, "tgbot_chat_id": payload.tgbot_chat_id,
+        "notify_on_task_finish": payload.notify_on_task_finish,
+        "notify_on_each_file": payload.notify_on_each_file,
+    }
+    dump_config(cfg)
+    link_engine_config(CONFIG_PATH)
+    return {"status": "saved", "storages_count": len(clean_storages)}
+
+# ==================== 网盘测试 ====================
+
+class TestStorageReq(BaseModel):
+    storage_id: str = ""
+
+@app.post("/api/test_storage", dependencies=[Depends(verify_auth)])
+def test_storage(req: TestStorageReq):
+    sid = req.storage_id
+    if not sid:
+        return {"ok": False, "msg": "请先保存配置后再测试该网盘"}
+    rname = remote_name_of(sid)
+    remote_dir = "tg_backup"
+    for s in load_config().get("_ui_storages", []):
+        if s.get("id") == sid:
+            remote_dir = s.get("remote_dir", "tg_backup")
+            break
+    cfg = load_config()
+    stype = next((s.get("type") for s in cfg.get("_ui_storages", []) if s.get("id") == sid), "webdav")
+
+    try:
+        if stype == "tgfs":
+            # TGFS 分支：只读列目录探测，绝不 mkdir 写入（设计文档 §5.4）
+            res = subprocess.run([RCLONE_BIN, "lsd", f"{rname}:", "--timeout", "15s"],
+                                 capture_output=True, text=True, timeout=20)
+            if res.returncode != 0:
+                # 不回显可能包含内部主机名/认证细节的 stderr
+                return {"ok": False, "msg": "TGFS WebDAV 只读连接失败，请检查服务日志"}
+            return {"ok": True, "msg": "TGFS WebDAV 只读连接测试成功（容量：未知）"}
+
+        test_dir = f"{rname}:{remote_dir}"
+        res = subprocess.run([RCLONE_BIN, "mkdir", test_dir, "--timeout", "15s"], capture_output=True, text=True)
+        if res.returncode != 0:
+            return {"ok": False, "msg": f"连接失败: {res.stderr.strip()}"}
+        try:
+            res2 = subprocess.run([RCLONE_BIN, "about", f"{rname}:", "--timeout", "8s"], capture_output=True, text=True)
+            quota = res2.stdout.strip().replace("\n", " | ") if res2.returncode == 0 and res2.stdout.strip() else "未知"
+        except Exception:
+            quota = "未知"
+        return {"ok": True, "msg": f"连接成功！({quota})"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "msg": "连接测试超时，请检查服务可用性"}
+    except Exception:
+        return {"ok": False, "msg": "连接测试异常，请检查服务日志"}
+
+class TestTGFSReq(BaseModel):
+    storage_id: str = ""
+
+
+@app.post("/api/tgfs/test", dependencies=[Depends(verify_auth)])
+def test_tgfs_endpoint(req: Optional[TestTGFSReq] = None):
+    """设计文档 §5.4 兼容端点：对已配置的 TGFS 网盘做只读列目录探测。
+
+    body 可省略（默认测第一个 TGFS），也可传 storage_id 指定某一个 TGFS。
+    不向浏览器回显可能含内部主机名/凭据细节的 stderr。
+    """
+    tgfs = [s for s in load_config().get("_ui_storages", []) if s.get("type") == "tgfs"]
+    if not tgfs:
+        raise HTTPException(status_code=400, detail="当前未配置任何 TGFS 存储")
+    sid = (req.storage_id if req and req.storage_id else "") or tgfs[0].get("id", "")
+    if sid not in {s.get("id") for s in tgfs}:
+        raise HTTPException(status_code=400, detail="指定的存储不是 TGFS 类型")
+    result = test_storage(TestStorageReq(storage_id=sid))
+    if not result.get("ok"):
+        raise HTTPException(status_code=503, detail=result.get("msg") or "TGFS WebDAV 连接失败，请检查服务日志")
+    return {"ok": True, "message": result["msg"]}
+
+
+@app.post("/api/test_notify", dependencies=[Depends(verify_auth)])
+def test_notify_api():
+    res = send_notification("测试通知", ["✅ **消息通道正常！**", f"网盘状态: `{get_rclone_quota_summary()}`"])
+    return {"ok": True, "msg": f"推送结果: {res}"}
+
+# ==================== 引擎控制 ====================
+
+@app.post("/api/control/{action}", dependencies=[Depends(verify_auth)])
+def control_engine(action: str):
+    global engine_thread
+    sync_session_files()
+    if action == "start":
+        if engine_thread is None or not engine_thread.is_alive():
+            stop_event.clear()
+            engine_logs.clear()
+            session_stats["downloaded_count"] = 0
+            session_stats["start_time"] = time.time()
+            link_engine_config(CONFIG_PATH)
+            engine_thread = threading.Thread(target=run_all_groups, daemon=True)
+            engine_thread.start()
+        return {"running": True}
+    elif action == "stop":
+        stop_event.set()
+        if downloader_proc and downloader_proc.poll() is None:
+            downloader_proc.terminate()
+        return {"running": False}
+    elif action == "restart":
+        stop_event.set()
+        if downloader_proc and downloader_proc.poll() is None:
+            downloader_proc.terminate()
+        if engine_thread and engine_thread.is_alive():
+            engine_thread.join(timeout=8)
+        stop_event.clear()
+        engine_logs.clear()
+        session_stats["downloaded_count"] = 0
+        session_stats["start_time"] = time.time()
+        link_engine_config(CONFIG_PATH)
+        engine_thread = threading.Thread(target=run_all_groups, daemon=True)
+        engine_thread.start()
+        return {"running": True}
+    raise HTTPException(status_code=400, detail="未知操作")
+
+@app.get("/api/logs", dependencies=[Depends(verify_auth)])
+def get_logs():
+    return {
+        "running": bool(engine_thread and engine_thread.is_alive()),
+        "logs": list(engine_logs), "stats": session_stats,
+    }
+
+@app.get("/api/media", dependencies=[Depends(verify_auth)])
+def list_media():
+    root = Path(load_config().get("save_path", "/app/save"))
+    if not root.exists():
+        return []
+    files = []
+    for p in sorted(root.rglob("*"), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True):
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mkv", ".mov", ".webm"}:
+            files.append({
+                "name": p.name, "rel_path": p.relative_to(root).as_posix(),
+                "type": "video" if p.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"} else "image",
+                "size_mb": round(p.stat().st_size / (1024*1024), 2),
+                "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime)),
+            })
+            if len(files) >= 200:
+                break
+    return files
+
+@app.get("/api/stream", dependencies=[Depends(verify_auth)])
+def stream_media(path: str):
+    root = Path(load_config().get("save_path", "/app/save")).resolve()
+    target = (root / path).resolve()
+    if not str(target).startswith(str(root)) or not target.is_file():
+        raise HTTPException(status_code=404)
+    mime, _ = mimetypes.guess_type(str(target))
+    return FileResponse(target, media_type=mime or "application/octet-stream")
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return Path("/app/templates/index.html").read_text(encoding="utf-8")

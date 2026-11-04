@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>TG Media Downloader Pro</title>
+  <!-- 依赖本地化：避免外网 CDN 不可达导致 Vue 未挂载、页面只剩背景色 -->
+  <script src="/vendor/tailwind.js"></script>
+  <script src="/vendor/vue.global.prod.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+<div id="app" class="max-w-6xl mx-auto p-6">
+  <div v-if="!authed" class="max-w-md mx-auto mt-24 bg-slate-800 p-8 rounded-2xl shadow-xl border border-slate-700">
+    <h2 class="text-2xl font-bold mb-2 text-center">🔐 安全验证</h2>
+    <input v-model="otpCode" maxlength="6" placeholder="000000" @keyup.enter="doLogin" class="w-full text-center tracking-widest text-2xl bg-slate-900 border border-slate-600 rounded-lg p-3 mb-4">
+    <button @click="doLogin" class="w-full bg-blue-600 hover:bg-blue-500 font-semibold py-3 rounded-lg">进入控制台</button>
+    <p v-if="errMsg" class="text-red-400 text-sm text-center mt-3">{{ errMsg }}</p>
+  </div>
+
+  <div v-else>
+    <header class="flex flex-wrap justify-between items-center pb-5 border-b border-slate-700 mb-6 gap-4">
+      <div class="flex items-center space-x-3">
+        <h1 class="text-2xl font-bold">🚀 TG 媒体中心 Pro</h1>
+        <span :class="cfg.running ? 'bg-emerald-600' : 'bg-rose-600'" class="px-3 py-1 rounded-full text-xs font-semibold">
+          {{ cfg.running ? '引擎运行中' : '引擎已停止' }}
+        </span>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button @click="tab='tg'" :class="tab==='tg'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">📱 登录与频道</button>
+        <button @click="tab='config'" :class="tab==='config'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">☁️ 网盘与存储</button>
+        <button @click="openNotify()" :class="tab==='notify'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">🔔 通知与日志</button>
+        <button @click="openPreview()" :class="tab==='preview'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">🎬 预览库</button>
+        <button v-if="!cfg.running" @click="control('start')" class="bg-emerald-600 px-4 py-2 rounded-lg text-sm">▶ 启动</button>
+        <button v-else @click="control('stop')" class="bg-rose-600 px-4 py-2 rounded-lg text-sm">⏹ 停止</button>
+        <button @click="logout" class="bg-slate-700 px-3 py-2 rounded-lg text-sm">退出</button>
+      </div>
+    </header>
+
+    <!-- ==================== 登录与频道 ==================== -->
+    <div v-if="tab==='tg'" class="space-y-6">
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+        <h3 class="text-lg font-semibold mb-3">👤 TG 账号授权</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <input type="number" v-model.number="cfg.api_id" placeholder="API ID" class="bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <input v-model="cfg.api_hash" placeholder="API Hash" class="bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <div class="flex space-x-2">
+            <input v-model="loginPhone" placeholder="+86..." class="flex-1 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+            <button @click="sendTgCode" class="bg-blue-600 px-3 py-2 rounded text-xs">发送验证码</button>
+          </div>
+        </div>
+        <div v-if="codeSent" class="flex gap-2 items-center">
+          <input v-model="tgCode" placeholder="输入验证码" class="w-32 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <input v-if="need2FA" v-model="tg2FA" type="password" placeholder="2FA密码" class="w-40 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <button @click="verifyTgCode" class="bg-emerald-600 px-4 py-2 rounded text-sm">确认登录</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col h-[520px]">
+          <div class="flex justify-between items-center pb-2 border-b border-slate-700">
+            <h3 class="font-semibold">📡 已加入频道</h3>
+            <button @click="fetchDialogs" class="bg-indigo-600 px-3 py-1.5 rounded text-xs">刷新频道</button>
+          </div>
+          <input v-model="dialogSearch" placeholder="搜索..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 my-2 text-sm">
+          <div class="flex-1 overflow-y-auto space-y-2">
+            <div v-for="d in filteredDialogs" :key="d.chat_id" class="flex justify-between items-center bg-slate-900 p-2.5 rounded border border-slate-700 text-sm">
+              <span class="truncate pr-2">{{ d.title }}</span>
+              <button @click="addChat(d)" class="bg-emerald-600 px-2.5 py-1 rounded text-xs whitespace-nowrap">+ 添加</button>
+            </div>
+          </div>
+        </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col h-[520px]">
+          <h3 class="font-semibold pb-2 border-b border-slate-700 mb-2">📥 监控队列 <span class="text-xs text-slate-400 font-normal">（每频道可指定存储目标）</span></h3>
+          <div class="flex-1 overflow-y-auto space-y-2">
+            <div v-for="(c, idx) in cfg.chats" :key="idx" class="bg-slate-900 p-2.5 rounded border border-slate-700 text-sm space-y-1">
+              <div class="flex justify-between">
+                <input v-model="c.title" class="bg-transparent text-blue-300 font-medium flex-1">
+                <button @click="cfg.chats.splice(idx,1)" class="text-rose-400 text-xs ml-2">删除</button>
+              </div>
+              <div class="grid grid-cols-3 gap-2 text-xs font-mono">
+                <input v-model="c.chat_id" placeholder="Chat ID" class="bg-slate-800 p-1 rounded col-span-1">
+                <input type="number" v-model.number="c.last_read_message_id" placeholder="起始ID" class="bg-slate-800 p-1 rounded col-span-1">
+                <select v-model="c.storage_id" class="bg-slate-800 p-1 rounded col-span-1 text-xs">
+                  <option value="">📁 本地存储</option>
+                  <option v-for="s in cfg.storages" :key="s.id" :value="s.id">☁️ {{ s.name }}</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <button @click="saveConfig" class="mt-3 w-full bg-emerald-600 font-bold py-2.5 rounded">保存配置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 网盘与存储 ==================== -->
+    <div v-if="tab==='config'" class="space-y-6">
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-4">
+        <h3 class="text-lg font-semibold border-b border-slate-700 pb-2">📁 本地存储与归档规则</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="text-xs text-slate-400">本地保存根目录（未配网盘的频道存这里）</label>
+            <input v-model="cfg.save_path" class="w-full bg-slate-900 border border-slate-700 rounded p-2 mt-1 text-sm">
+          </div>
+          <div>
+            <label class="text-xs text-slate-400">自动归档结构预览</label>
+            <input disabled value="[save_path] / 频道名称 / YYYY-MM / 文件" class="w-full bg-slate-950 text-emerald-400 border border-slate-800 rounded p-2 mt-1 text-xs font-mono">
+          </div>
+        </div>
+      </div>
+
+      <!-- 多网盘管理 -->
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-4">
+        <div class="flex justify-between items-center border-b border-slate-700 pb-2">
+          <h3 class="text-lg font-semibold">☁️ 网盘管理 <span class="text-xs text-slate-400 font-normal">（支持添加多个网盘，频道可分别指定）</span></h3>
+          <button @click="addStorage" class="bg-emerald-600 px-3 py-1.5 rounded text-xs font-semibold">+ 添加网盘</button>
+        </div>
+        <p class="text-xs text-slate-400 leading-relaxed bg-slate-900/60 p-3 rounded-lg">
+          ℹ️ 启动下载时，系统会按「频道 → 存储目标」自动分组，逐组生成独立配置并依次运行下载引擎；
+          每组只上传到该组指定的网盘，未指定网盘的频道保留在本地。各组结束后水位线会自动回写，不会重复下载。
+          <br>TGFS 需单独部署 WebDAV 服务并显式勾选上传授权才会参与自动上传，未授权时自动降级为本地存储。
+        </p>
+
+        <div v-if="!cfg.storages || cfg.storages.length === 0" class="text-center text-slate-500 py-8 text-sm">
+          暂未配置网盘。点击「添加网盘」开始配置 InfiniCLOUD / WebDAV / SMB / TGFS 存储目标。
+        </div>
+
+        <div v-for="(s, idx) in cfg.storages" :key="idx" class="bg-slate-900 p-4 rounded-lg border space-y-3" :class="s.type==='tgfs' ? 'border-amber-600/70' : 'border-slate-700'">
+          <div class="flex justify-between items-center">
+            <input v-model="s.name" placeholder="网盘名称（如：我的InfiniCLOUD）" class="bg-transparent text-blue-300 font-semibold flex-1 text-sm">
+            <div class="flex gap-2 ml-2">
+              <button @click="testStorage(s.id)" class="bg-indigo-600 px-3 py-1 rounded text-xs">⚡ 测试</button>
+              <button @click="cfg.storages.splice(idx,1)" class="bg-rose-600 px-3 py-1 rounded text-xs">删除</button>
+            </div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
+            <select v-model="s.type" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+              <option value="infinicloud">InfiniCLOUD</option>
+              <option value="webdav">WebDAV</option>
+              <option value="smb">SMB</option>
+              <option value="tgfs">TGFS（独立 WebDAV 网关）</option>
+            </select>
+            <input v-model="s.url" :placeholder="storageUrlPlaceholder(s)" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm col-span-2">
+            <input v-model="s.remote_dir" placeholder="远程目录(如 tg_backup)" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <input v-model="s.user" placeholder="用户名 / User ID" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+            <input v-model="s.pass" :type="s._showPass ? 'text' : 'password'" :placeholder="s.has_pass ? '已配置（留空保持不变）' : '密码 / Apps Password'" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+          </div>
+
+          <!-- TGFS 分支：只读探测 + 显式上传授权 -->
+          <div v-if="s.type==='tgfs'" class="bg-amber-950/40 border border-amber-700/60 rounded-lg p-3 space-y-2 text-xs text-amber-200">
+            <p class="leading-relaxed">
+              ⚠️ TGFS 通过 Rclone 的 <b>webdav</b> 后端接入（Rclone 没有名为 tgfs 的驱动）。请填写<b>已单独部署</b>的 TGFS WebDAV Endpoint 完整地址，
+              例如内网 <code class="text-amber-300">http://tgfs:8080/webdav</code> 或 <code class="text-amber-300">http://192.168.x.x:PORT/webdav</code>。
+              公网地址必须使用 HTTPS；URL 内不得夹带账号、密码、查询串或片段。
+            </p>
+            <p class="leading-relaxed">
+              仅用于经授权的测试或媒体存储。连接测试执行只读列目录（lsd），<b>不会创建目录或写入文件</b>；容量固定显示「未知」。
+            </p>
+            <label class="flex items-start gap-2 font-semibold text-amber-100">
+              <input type="checkbox" v-model="s.upload_authorized" class="w-4 h-4 mt-0.5 shrink-0">
+              <span>我已确认来源合规并显式授权：允许把指向该 TGFS 的频道文件上传到此存储</span>
+            </label>
+            <p v-if="!s.upload_authorized" class="text-amber-300">
+              当前为只读模式：即使频道选择了该网盘，下载结果也会保留在本地，不会自动上传。
+            </p>
+            <div class="flex flex-wrap items-center gap-2 pt-1">
+              <button @click="testTGFS(s.id)" class="bg-indigo-600 px-3 py-1.5 rounded text-xs font-semibold">🔎 测试 TGFS 连接（只读）</button>
+              <span v-if="!s.id" class="text-amber-300">新增网盘请先保存配置再测试</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="cfg.storages && cfg.storages.length > 0" class="flex items-center gap-4 pt-2">
+          <label class="flex items-center gap-2 text-sm text-slate-300">
+            <input type="checkbox" v-model="cfg.delete_after_upload" class="w-4 h-4">
+            上传后删除本地文件
+          </label>
+        </div>
+      </div>
+
+      <!-- 存储路由总览 -->
+      <div v-if="cfg.chats && cfg.chats.length > 0" class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
+        <h3 class="text-lg font-semibold border-b border-slate-700 pb-2">🗺️ 存储路由总览</h3>
+        <div class="space-y-1.5">
+          <div v-for="c in cfg.chats" :key="c.chat_id" class="flex items-center justify-between bg-slate-900 p-2 rounded text-sm">
+            <span class="text-blue-300">{{ c.title || c.chat_id }}</span>
+            <span class="text-xs">
+              <span v-if="!c.storage_id" class="text-slate-400">📁 本地存储</span>
+              <span v-else class="text-emerald-400">☁️ {{ storageName(c.storage_id) }}</span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <button @click="saveConfig" class="w-full bg-emerald-600 font-bold py-3 rounded-xl">💾 保存全部配置</button>
+    </div>
+
+    <!-- ==================== 通知与日志 ==================== -->
+    <div v-if="tab==='notify'" class="space-y-6">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
+          <div class="flex justify-between items-center"><h3 class="font-semibold">🐦 飞书通知</h3><input type="checkbox" v-model="cfg.feishu_enable"></div>
+          <input v-model="cfg.feishu_webhook" placeholder="Webhook URL" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+        </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
+          <div class="flex justify-between items-center"><h3 class="font-semibold">🤖 TG Bot 通知</h3><input type="checkbox" v-model="cfg.tgbot_enable"></div>
+          <input v-model="cfg.tgbot_token" placeholder="Bot Token" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <input v-model="cfg.tgbot_chat_id" placeholder="Chat ID" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+        </div>
+      </div>
+      <div class="flex space-x-3">
+        <button @click="testNotify" class="bg-indigo-600 px-4 py-2 rounded text-sm">📨 发送测试通知</button>
+        <button @click="saveConfig" class="bg-emerald-600 px-5 py-2 rounded text-sm font-bold">💾 保存通知配置</button>
+      </div>
+      <div class="bg-slate-950 p-4 rounded-xl border border-slate-800">
+        <div class="flex justify-between items-center mb-2"><span class="text-xs font-mono text-slate-400">🖥️ 实时日志输出</span><button @click="fetchLogs" class="text-xs bg-slate-800 px-3 py-1 rounded">刷新</button></div>
+        <div class="h-64 overflow-y-auto font-mono text-xs text-emerald-400 space-y-1 p-2 bg-black/50 rounded">
+          <div v-for="(l, i) in logs" :key="i">{{ l }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 预览库 ==================== -->
+    <div v-if="tab==='preview'">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div v-for="item in mediaList" :key="item.rel_path" class="bg-slate-800 rounded-xl overflow-hidden border border-slate-700 flex flex-col">
+          <div class="h-48 bg-black flex items-center justify-center">
+            <img v-if="item.type==='image'" :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" class="object-cover w-full h-full">
+            <video v-else :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" controls class="w-full h-full"></video>
+          </div>
+          <div class="p-3 text-xs truncate">{{ item.name }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const { createApp } = Vue;
+createApp({
+  data() {
+    return {
+      authed: false, otpCode: '', errMsg: '', tab: 'tg',
+      cfg: { file_path_prefix: ['chat_title', 'media_datetime'], media_types: ['photo', 'video'], chats: [], storages: [] },
+      tgStatus: { logged_in: false }, loginPhone: '', codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
+      dialogs: [], dialogSearch: '', logs: [], mediaList: []
+    }
+  },
+  computed: {
+    filteredDialogs() {
+      const q = this.dialogSearch.toLowerCase();
+      return q ? this.dialogs.filter(d => d.title.toLowerCase().includes(q) || String(d.chat_id).includes(q)) : this.dialogs;
+    }
+  },
+  mounted() { this.fetchConfig(); setInterval(() => { if(this.authed && this.tab==='notify') this.fetchLogs(); }, 3000); },
+  methods: {
+    async doLogin() {
+      const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ otp_code: this.otpCode }) });
+      if (res.ok) this.fetchConfig(); else this.errMsg = '验证码错误';
+    },
+    async logout() { await fetch('/api/logout', { method: 'POST' }); this.authed = false; },
+    async fetchConfig() {
+      const res = await fetch('/api/config');
+      if (res.status === 401) { this.authed = false; return; }
+      this.cfg = await res.json();
+      if (!this.cfg.storages) this.cfg.storages = [];
+      if (!this.cfg.chats) this.cfg.chats = [];
+      this.authed = true;
+    },
+    async sendTgCode() {
+      const res = await fetch('/api/tg/send_code', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ api_id: this.cfg.api_id, api_hash: this.cfg.api_hash, phone: this.loginPhone }) });
+      if (res.ok) this.codeSent = true; else alert('发送失败');
+    },
+    async verifyTgCode() {
+      const res = await fetch('/api/tg/verify_code', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ code: this.tgCode, password: this.tg2FA }) });
+      const data = await res.json();
+      if (res.ok && data.need_2fa) this.need2FA = true;
+      else if (res.ok && data.ok) { this.codeSent = false; alert('登录成功'); this.fetchDialogs(); }
+      else alert('验证失败');
+    },
+    async fetchDialogs() {
+      const res = await fetch('/api/tg/dialogs');
+      if (res.ok) this.dialogs = (await res.json()).dialogs;
+    },
+    isChatSelected(id) { return this.cfg.chats.some(c => String(c.chat_id) === String(id)); },
+    addChat(d) {
+      if (this.isChatSelected(d.chat_id)) return;
+      this.cfg.chats.push({ chat_id: d.chat_id, title: d.title, last_read_message_id: 0, storage_id: '' });
+    },
+    async openNotify() { this.tab = 'notify'; await this.fetchLogs(); },
+    async openPreview() { await this.loadMedia(); this.tab = 'preview'; },
+    storageName(sid) {
+      const s = (this.cfg.storages || []).find(x => x.id === sid);
+      return s ? s.name : sid;
+    },
+    addStorage() {
+      if (!this.cfg.storages) this.cfg.storages = [];
+      this.cfg.storages.push({ id: '', name: '', type: 'infinicloud', url: '', user: '', pass: '', remote_dir: 'tg_backup', has_pass: false, upload_authorized: false });
+    },
+    storageUrlPlaceholder(s) {
+      if (s.type === 'infinicloud') return '节点名(如 aki)';
+      if (s.type === 'webdav') return 'https://host/dav/';
+      if (s.type === 'tgfs') return 'http://tgfs:8080/webdav 或内网 https://host/webdav';
+      return 'SMB主机IP';
+    },
+    async saveConfig() {
+      // 清理前端临时字段（has_pass / _showPass 不回传后端）
+      const payload = JSON.parse(JSON.stringify(this.cfg));
+      if (payload.storages) {
+        payload.storages.forEach(s => { delete s.has_pass; delete s._showPass; });
+      }
+      let res;
+      try {
+        res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+      } catch (e) {
+        alert('保存失败：无法连接服务 (' + e + ')');
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      // 必须以后端返回为准，不能无条件提示「已保存」
+      if (res.ok && data.status === 'saved') { alert('配置已保存！共 ' + data.storages_count + ' 个存储目标'); this.fetchConfig(); }
+      else alert('保存失败：' + (data.detail || '未知错误'));
+    },
+    async testStorage(sid) {
+      if (!sid) { alert('这是新增的网盘，请先点「保存全部配置」后再测试连接'); return; }
+      const r = await fetch('/api/test_storage', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ storage_id: sid }) });
+      alert((await r.json().catch(() => ({ msg: '测试请求失败' }))).msg);
+    },
+    async testTGFS(sid) {
+      if (!sid) { alert('这是新增的 TGFS 网盘，请先点「保存全部配置」后再测试连接'); return; }
+      let r;
+      try {
+        r = await fetch('/api/tgfs/test', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ storage_id: sid })
+        });
+      } catch (e) {
+        alert('测试失败：无法连接服务 (' + e + ')');
+        return;
+      }
+      const d = await r.json().catch(() => ({}));
+      alert(d.message || d.detail || '测试完成');
+    },
+    async testNotify() { const r = await fetch('/api/test_notify', { method: 'POST' }); alert((await r.json()).msg); },
+    async fetchLogs() { const r = await fetch('/api/logs'); if(r.ok) { const d = await r.json(); this.logs = d.logs; this.cfg.running = d.running; } },
+    async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
+    async loadMedia() { const r = await fetch('/api/media'); if(r.ok) this.mediaList = await r.json(); }
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

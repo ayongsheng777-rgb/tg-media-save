@@ -1,0 +1,15 @@
+# 本地密钥与运行数据，一律不入库
+.env
+config/
+config_store/
+sessions/
+downloads/
+rclone/
+*.session
+*.session-journal
+
+# Python / 编辑器
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

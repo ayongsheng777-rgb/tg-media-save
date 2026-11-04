@@ -1,0 +1,22 @@
+services:
+  tg-pro-downloader:
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-}
+    container_name: tg-pro-downloader
+    restart: unless-stopped
+    ports:
+      - "8082:8080"   # WebUI 管理后台端口（宿主 8082 -> 容器 8080，避开已占用的 8080）
+    volumes:
+      - ./config:/app/config_store
+      - ./sessions:/app/sessions
+      - ./downloads:/app/save
+      # 设计文档 §6：持久化 rclone.conf，避免重建容器后网盘凭据/remote 丢失
+      - ./rclone:/root/.config/rclone
+    environment:
+      - TZ=Asia/Shanghai
+      # 密钥由本地 .env 提供（复制 .env.example 后自行生成强随机值）
+      - JWT_SECRET=${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
+      - OTP_SECRET=${OTP_SECRET:?请在 .env 中设置 OTP_SECRET}
