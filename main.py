@@ -25,9 +25,35 @@ RCLONE_CONF_PATH = Path("/root/.config/rclone/rclone.conf")
 RCLONE_BIN = "/app/rclone/rclone"
 
 JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
-OTP_SECRET = os.getenv("OTP_SECRET") or pyotp.random_base32()
+
+# 动态口令：优先使用「设置 → 动态口令换绑」写入并持久化的密钥；
+# 未换绑时回落到环境变量 OTP_SECRET（向后兼容现有部署，不会把用户锁在门外）。
+ENV_OTP_SECRET = os.getenv("OTP_SECRET") or pyotp.random_base32()
+OTP_SECRET_FILE = Path("/app/config_store/otp_secret")
+OTP_ISSUER = "TG Media Downloader Pro"
+OTP_ACCOUNT = "admin"
+OTP_PENDING_TTL = 300  # 换绑会话 5 分钟有效
+_otp_lock = threading.Lock()
+_otp_pending = {"secret": "", "created_at": 0.0}
 
 ALLOWED_STORAGE_TYPES = {"infinicloud", "webdav", "smb", "tgfs"}
+
+def _read_custom_otp_secret():
+    try:
+        raw = OTP_SECRET_FILE.read_text(encoding="utf-8").strip().upper()
+    except OSError:
+        return None
+    return raw if re.fullmatch(r"[A-Z2-7]{16,64}", raw) else None
+
+def current_otp_secret() -> str:
+    """每次请求实时读取，换绑确认后立刻生效；文件丢失则回落到环境变量。"""
+    return _read_custom_otp_secret() or ENV_OTP_SECRET
+
+def otp_source() -> str:
+    return "custom" if _read_custom_otp_secret() else "env"
+
+def otp_provisioning_uri(secret: str) -> str:
+    return pyotp.TOTP(secret).provisioning_uri(name=OTP_ACCOUNT, issuer_name=OTP_ISSUER)
 
 # 引擎分组运行状态
 downloader_proc: Optional[subprocess.Popen] = None
@@ -74,11 +100,10 @@ def init_env():
     ENGINE_CONFIG_LINK.symlink_to(CONFIG_PATH)
 
 init_env()
-totp = pyotp.TOTP(OTP_SECRET)
 # 安全：不在容器日志中输出 OTP 密钥 / provisioning URI（见设计文档 §2）
 print("\n========== [安全中心] ==========")
-print("OTP 密钥由环境变量 OTP_SECRET 提供（日志不回显明文）")
-print("如需重置，请修改 docker-compose.yml 后重建容器")
+print("动态口令来源：" + ("自定义密钥（设置页换绑，已持久化）" if otp_source() == "custom" else "环境变量 OTP_SECRET"))
+print("可在 WebUI「安全设置」中换绑；日志不回显任何密钥")
 print("================================\n")
 
 # 前端依赖本地化：避免 CDN 不可达导致 Vue 未挂载、页面只剩背景色
@@ -457,7 +482,7 @@ class LoginReq(BaseModel):
 
 @app.post("/api/login")
 def login(req: LoginReq, response: Response):
-    if not totp.verify(req.otp_code, valid_window=1):
+    if not pyotp.TOTP(current_otp_secret()).verify(req.otp_code, valid_window=1):
         raise HTTPException(status_code=403, detail="OTP 错误")
     token = jwt.encode({"exp": time.time() + (30*86400 if req.remember_30d else 86400), "sub": "admin"}, JWT_SECRET, algorithm="HS256")
     response.set_cookie(key="tg_device_token", value=token, max_age=30*86400, httponly=True, samesite="lax")
@@ -467,6 +492,76 @@ def login(req: LoginReq, response: Response):
 def logout(response: Response):
     response.delete_cookie("tg_device_token")
     return {"status": "ok"}
+
+# ==================== 安全设置：动态口令换绑 ====================
+# 两阶段确认：先用当前口令证明身份 → 生成待确认密钥 → 用新口令确认后才落盘。
+# 确认前旧口令一直有效，pending 只在内存中且 5 分钟过期，避免把自己锁在门外。
+
+class OtpCurrentReq(BaseModel):
+    current_code: str
+
+class OtpCodeReq(BaseModel):
+    code: str
+
+@app.get("/api/security/otp", dependencies=[Depends(verify_auth)])
+def otp_status():
+    with _otp_lock:
+        pending = bool(_otp_pending["secret"] and time.time() - _otp_pending["created_at"] < OTP_PENDING_TTL)
+    return {
+        "source": otp_source(),
+        "issuer": OTP_ISSUER,
+        "account": OTP_ACCOUNT,
+        "has_env_secret": bool(os.getenv("OTP_SECRET")),
+        "pending": pending,
+    }
+
+@app.post("/api/security/otp/begin", dependencies=[Depends(verify_auth)])
+def otp_begin(req: OtpCurrentReq):
+    if not pyotp.TOTP(current_otp_secret()).verify(req.current_code.strip(), valid_window=1):
+        raise HTTPException(status_code=403, detail="当前动态口令不正确")
+    secret = pyotp.random_base32()
+    with _otp_lock:
+        _otp_pending.update({"secret": secret, "created_at": time.time()})
+    return {"secret": secret, "uri": otp_provisioning_uri(secret), "expires_in": OTP_PENDING_TTL}
+
+@app.post("/api/security/otp/confirm", dependencies=[Depends(verify_auth)])
+def otp_confirm(req: OtpCodeReq):
+    with _otp_lock:
+        secret, created = _otp_pending["secret"], _otp_pending["created_at"]
+        if not secret or time.time() - created >= OTP_PENDING_TTL:
+            _otp_pending.update({"secret": "", "created_at": 0.0})
+            raise HTTPException(status_code=400, detail="换绑会话已过期，请重新生成")
+        if not pyotp.TOTP(secret).verify(req.code.strip(), valid_window=1):
+            raise HTTPException(status_code=403, detail="新动态口令不正确，请确认已用新验证器扫码或手动录入")
+        OTP_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = OTP_SECRET_FILE.with_suffix(".tmp")
+        tmp.write_text(secret + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, OTP_SECRET_FILE)
+        _otp_pending.update({"secret": "", "created_at": 0.0})
+    return {"status": "ok", "source": "custom", "message": "换绑成功，下次登录请使用新的动态口令"}
+
+@app.post("/api/security/otp/cancel", dependencies=[Depends(verify_auth)])
+def otp_cancel():
+    with _otp_lock:
+        _otp_pending.update({"secret": "", "created_at": 0.0})
+    return {"status": "ok"}
+
+@app.post("/api/security/otp/reset", dependencies=[Depends(verify_auth)])
+def otp_reset(req: OtpCodeReq):
+    """清除自定义密钥，恢复使用环境变量 OTP_SECRET（需验证当前生效的口令）。"""
+    if not pyotp.TOTP(current_otp_secret()).verify(req.code.strip(), valid_window=1):
+        raise HTTPException(status_code=403, detail="动态口令不正确")
+    try:
+        OTP_SECRET_FILE.unlink(missing_ok=True)
+    except OSError:
+        raise HTTPException(status_code=500, detail="无法清除自定义密钥")
+    with _otp_lock:
+        _otp_pending.update({"secret": "", "created_at": 0.0})
+    return {"status": "ok", "source": "env", "message": "已恢复为环境变量密钥，请重新绑定原来的验证器"}
 
 # ==================== TG 客户端 ====================
 

@@ -2,228 +2,464 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>TG Media Downloader Pro</title>
-  <!-- 依赖本地化：避免外网 CDN 不可达导致 Vue 未挂载、页面只剩背景色 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TG 媒体中心 Pro</title>
+  <!-- 依赖全部本地化：避免外网 CDN 不可达导致 Vue 未挂载、页面只剩背景色 -->
   <script src="/vendor/tailwind.js"></script>
   <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/vendor/qrcode.js"></script>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen">
-<div id="app" class="max-w-6xl mx-auto p-6">
-  <div v-if="!authed" class="max-w-md mx-auto mt-24 bg-slate-800 p-8 rounded-2xl shadow-xl border border-slate-700">
-    <h2 class="text-2xl font-bold mb-2 text-center">🔐 安全验证</h2>
-    <input v-model="otpCode" maxlength="6" placeholder="000000" @keyup.enter="doLogin" class="w-full text-center tracking-widest text-2xl bg-slate-900 border border-slate-600 rounded-lg p-3 mb-4">
-    <button @click="doLogin" class="w-full bg-blue-600 hover:bg-blue-500 font-semibold py-3 rounded-lg">进入控制台</button>
-    <p v-if="errMsg" class="text-red-400 text-sm text-center mt-3">{{ errMsg }}</p>
+<body>
+<!-- 视觉风格：借鉴青鸟「2026 水果自然风」——远山黛渐变 / 豆腐白液态玻璃 / 果色高光 / 状态呼吸灯 -->
+<style>
+:root {
+  --mountain-mist:#dfe8f0; --slate-light:#eef2f5;
+  --tofu-white:rgba(255,254,248,.78); --tofu-solid:#fffef8;
+  --peach-pink:#f49bab; --muscat-green:#8fc97f; --citrus-yellow:#f2c14e;
+  --berry-purple:#9b7ed9; --spring-blue:#6cb4d6; --mint-green:#9fdcc3;
+  --forest-green:#2d6a4f; --sunset-orange:#e7734a; --blood-orange:#c0392b;
+  --ink:#33414e; --ink-soft:#6b7a88;
+}
+body {
+  background:
+    radial-gradient(1200px 600px at 85% -10%, rgba(155,126,217,.14), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(143,201,127,.16), transparent 55%),
+    radial-gradient(700px 420px at 60% 120%, rgba(244,155,171,.10), transparent 55%),
+    linear-gradient(160deg, var(--mountain-mist) 0%, var(--slate-light) 100%);
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+}
+.qb-card {
+  background: var(--tofu-white) !important;
+  backdrop-filter: blur(18px) saturate(1.25);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  border: 1px solid rgba(255,255,255,.65) !important;
+  border-radius: 20px !important;
+  padding: 22px;
+  box-shadow: 0 8px 28px rgba(51,65,78,.08), inset 0 1px 0 rgba(255,255,255,.8) !important;
+  transition: transform .35s cubic-bezier(.22,1,.36,1), box-shadow .35s;
+  position: relative;
+  overflow: hidden;
+}
+.qb-card:hover { transform: translateY(-3px); box-shadow: 0 16px 40px rgba(51,65,78,.13), inset 0 1px 0 rgba(255,255,255,.9) !important; }
+.qb-card::before {
+  content: ""; position: absolute; top:0; left:0; right:0; height:4px;
+  background: linear-gradient(90deg, transparent, var(--accent, var(--muscat-green)), transparent);
+  opacity:.85;
+}
+.qb-card.accent-peach  { --accent:var(--peach-pink); }
+.qb-card.accent-muscat { --accent:var(--muscat-green); }
+.qb-card.accent-citrus { --accent:var(--citrus-yellow); }
+.qb-card.accent-berry  { --accent:var(--berry-purple); }
+.qb-card.accent-spring { --accent:var(--spring-blue); }
+.qb-card.accent-mint   { --accent:var(--mint-green); }
+.qb-card-title {
+  font-size:14px; font-weight:600; color:var(--ink-soft); letter-spacing:.04em;
+  margin-bottom:14px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+}
+.qb-section-title { font-size:16px; font-weight:700; color:var(--ink); margin-bottom:12px; }
+.qb-label { display:block; font-size:12px; color:var(--ink-soft); margin-bottom:6px; }
+.qb-hint { font-size:12px; color:var(--ink-soft); line-height:1.6; }
+.qb-input, select.qb-input, textarea.qb-input {
+  width:100%; background:rgba(255,255,255,.72) !important;
+  border:1px solid rgba(51,65,78,.12) !important; border-radius:10px !important;
+  padding:9px 12px; color:var(--ink) !important; font-size:13px;
+  box-shadow:none !important; transition:box-shadow .25s, border-color .25s;
+}
+.qb-input::placeholder { color:#9aa7b2; }
+.qb-input:focus { outline:none !important; border-color:var(--muscat-green) !important; box-shadow:0 0 0 2px rgba(94,163,99,.25) !important; }
+.qb-input:disabled { background:rgba(255,255,255,.45) !important; color:var(--ink-soft) !important; }
+.qb-btn {
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  border:none !important; border-radius:10px !important; padding:9px 16px;
+  font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;
+  transition:all .25s cubic-bezier(.22,1,.36,1);
+}
+.qb-btn:active { transform:scale(.96); }
+.qb-btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+.qb-btn-sm { padding:6px 12px; font-size:12px; }
+.qb-btn-primary { background:linear-gradient(135deg,#6db472,#4a8550) !important; color:#fff !important; box-shadow:0 4px 14px rgba(94,163,99,.35); }
+.qb-btn-primary:hover:not(:disabled) { box-shadow:0 6px 20px rgba(94,163,99,.5); transform:translateY(-1px); }
+.qb-btn-soft { background:rgba(255,255,255,.78) !important; color:var(--ink) !important; border:1px solid rgba(51,65,78,.12) !important; }
+.qb-btn-soft:hover:not(:disabled) { background:#fff !important; }
+.qb-btn-info { background:linear-gradient(135deg,#7cc0dd,#4d90b3) !important; color:#fff !important; box-shadow:0 4px 14px rgba(76,144,179,.3); }
+.qb-btn-warn { background:linear-gradient(135deg,#f3a98f,#e7734a) !important; color:#fff !important; }
+.qb-btn-danger { background:linear-gradient(135deg,#dc6a5c,#c0392b) !important; color:#fff !important; }
+.qb-tag { display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:4px 12px; font-size:11px; font-weight:600; border:none !important; }
+.qb-tag-ok { background:rgba(143,201,127,.24); color:#2d6a4f; }
+.qb-tag-warn { background:rgba(242,193,78,.28); color:#9a6a10; }
+.qb-tag-danger { background:rgba(192,57,43,.14); color:#c0392b; }
+.qb-tag-info { background:rgba(108,180,214,.22); color:#2f6d8c; }
+.qb-status-dot { width:10px; height:10px; border-radius:50%; display:inline-block; position:relative; }
+.qb-status-dot.on { background:var(--muscat-green); }
+.qb-status-dot.on::after { content:""; position:absolute; inset:-4px; border-radius:50%; border:2px solid var(--muscat-green); animation:qb-ripple 1.8s ease-out infinite; }
+.qb-status-dot.off { background:#b0b8bf; }
+@keyframes qb-ripple { 0%{transform:scale(.6);opacity:.9} 100%{transform:scale(1.4);opacity:0} }
+.qb-header { margin-bottom:18px; }
+.qb-logo { font-size:28px; width:46px; height:46px; display:flex; align-items:center; justify-content:center; border-radius:14px; background:rgba(255,255,255,.7); box-shadow:inset 0 1px 0 #fff; }
+.qb-brand { font-size:20px; font-weight:800; color:var(--ink); line-height:1.2; }
+.qb-brand-sub { font-size:11px; color:var(--ink-soft); margin-top:2px; }
+.qb-nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; padding-top:16px; border-top:1px solid rgba(51,65,78,.07); }
+.qb-nav-tab { border:none; border-radius:10px; padding:8px 14px; font-size:13px; font-weight:600; background:rgba(255,255,255,.6); color:var(--ink-soft); cursor:pointer; transition:all .25s; }
+.qb-nav-tab:hover { background:#fff; color:var(--ink); }
+.qb-nav-tab.active { background:linear-gradient(135deg,#6db472,#4a8550) !important; color:#fff !important; box-shadow:0 4px 14px rgba(94,163,99,.3); }
+.qb-alert { border-radius:12px; padding:12px 14px; font-size:12px; line-height:1.75; background:rgba(108,180,214,.12); border:1px solid rgba(108,180,214,.25); color:#2f6d8c; }
+.qb-alert.warn { background:rgba(242,193,78,.14); border-color:rgba(242,193,78,.35); color:#8a6316; }
+.qb-alert.danger { background:rgba(192,57,43,.10); border-color:rgba(192,57,43,.25); color:#a5342a; }
+.qb-alert-title { font-weight:700; font-size:13px; margin-bottom:3px; }
+.qb-link-row { display:flex; flex-wrap:wrap; gap:10px; margin-top:9px; }
+.qb-link { display:inline-flex; align-items:center; gap:4px; padding:6px 12px; border-radius:9px; background:rgba(255,255,255,.8); color:#2f6d8c; font-size:12px; font-weight:600; text-decoration:none; border:1px solid rgba(108,180,214,.35); transition:all .25s; }
+.qb-link:hover { background:#fff; transform:translateY(-1px); box-shadow:0 4px 12px rgba(76,144,179,.18); }
+.qb-link-sub { background:rgba(255,255,255,.5); color:var(--ink-soft); border-color:rgba(51,65,78,.12); }
+.qb-subcard { background:rgba(255,255,255,.55); border:1px solid rgba(255,255,255,.8); border-radius:14px; padding:12px; }
+.qb-log { background:rgba(24,34,44,.93); color:#9fdcc3; border-radius:12px; padding:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; line-height:1.6; }
+.qb-code { display:inline-block; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; letter-spacing:.06em; word-break:break-all; background:rgba(255,255,255,.75); border:1px solid rgba(51,65,78,.12); border-radius:9px; padding:8px 10px; color:var(--ink); }
+.qb-code-input { max-width:170px; text-align:center; letter-spacing:.28em; font-size:18px; font-weight:700; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+.qb-divider { height:1px; background:rgba(51,65,78,.09); margin:20px 0 16px; }
+.qb-msg { margin-top:14px; border-radius:10px; padding:10px 14px; font-size:12px; line-height:1.6; }
+.qb-msg.ok { background:rgba(143,201,127,.18); color:#2d6a4f; border:1px solid rgba(143,201,127,.35); }
+.qb-msg.err { background:rgba(192,57,43,.10); color:#a5342a; border:1px solid rgba(192,57,43,.25); }
+.qb-qr { min-height:168px; display:flex; align-items:center; justify-content:center; background:#fff; border-radius:12px; padding:8px; border:1px solid rgba(51,65,78,.10); }
+.qb-qr img { image-rendering:pixelated; }
+.qb-qr-fallback { font-size:12px; color:var(--ink-soft); text-align:center; padding:24px; }
+.qb-list { margin:0; padding-left:20px; font-size:12px; line-height:2; color:var(--ink-soft); }
+.qb-login-wrap { min-height:88vh; display:flex; align-items:center; justify-content:center; }
+.qb-login { width:100%; max-width:420px; text-align:center; }
+.qb-login-icon { font-size:40px; margin-bottom:8px; }
+.qb-login-title { font-size:24px; font-weight:800; color:var(--ink); }
+.qb-login-sub { font-size:12px; color:var(--ink-soft); margin:6px 0 20px; }
+.qb-otp-input { text-align:center; letter-spacing:.5em; font-size:26px; font-weight:700; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; margin-bottom:14px; }
+.qb-login-btn { width:100%; padding:12px; }
+.qb-error { color:var(--blood-orange); font-size:12px; margin-top:12px; }
+.qb-login-foot { margin-top:18px; font-size:11px; color:var(--ink-soft); }
+.qb-inline-form { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+::-webkit-scrollbar { width:8px; height:8px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:rgba(107,122,136,.3); border-radius:999px; }
+::-webkit-scrollbar-thumb:hover { background:rgba(94,163,99,.55); }
+@media (max-width:768px) {
+  .qb-card { padding:16px !important; }
+  .qb-nav-tab { padding:7px 10px; font-size:12px; }
+  .qb-brand { font-size:17px; }
+}
+</style>
+<div id="app" class="max-w-6xl mx-auto p-4 md:p-6">
+  <!-- ==================== 登录 ==================== -->
+  <div v-if="!authed" class="qb-login-wrap">
+    <div class="qb-card qb-login accent-muscat">
+      <div class="qb-login-icon">🔐</div>
+      <h2 class="qb-login-title">安全验证</h2>
+      <p class="qb-login-sub">请输入验证器中的 6 位动态口令</p>
+      <input v-model="otpCode" maxlength="6" inputmode="numeric" placeholder="000000" @keyup.enter="doLogin" class="qb-input qb-otp-input">
+      <button @click="doLogin" class="qb-btn qb-btn-primary qb-login-btn">进入控制台</button>
+      <p v-if="errMsg" class="qb-error">{{ errMsg }}</p>
+      <div class="qb-login-foot">忘记口令？需在部署环境重置 OTP_SECRET，或在「安全设置」中换绑</div>
+    </div>
   </div>
 
   <div v-else>
-    <header class="flex flex-wrap justify-between items-center pb-5 border-b border-slate-700 mb-6 gap-4">
-      <div class="flex items-center space-x-3">
-        <h1 class="text-2xl font-bold">🚀 TG 媒体中心 Pro</h1>
-        <span :class="cfg.running ? 'bg-emerald-600' : 'bg-rose-600'" class="px-3 py-1 rounded-full text-xs font-semibold">
-          {{ cfg.running ? '引擎运行中' : '引擎已停止' }}
-        </span>
+    <!-- ==================== 顶栏与导航 ==================== -->
+    <header class="qb-card qb-header accent-spring">
+      <div class="flex flex-wrap justify-between items-center gap-4">
+        <div class="flex items-center gap-3 flex-wrap">
+          <div class="qb-logo">🚀</div>
+          <div>
+            <h1 class="qb-brand">TG 媒体中心 Pro</h1>
+            <div class="qb-brand-sub">频道媒体归档 · 多网盘路由</div>
+          </div>
+          <span class="qb-tag" :class="cfg.running ? 'qb-tag-ok' : 'qb-tag-danger'">
+            <span class="qb-status-dot" :class="cfg.running ? 'on' : 'off'"></span>
+            {{ cfg.running ? '引擎运行中' : '引擎已停止' }}
+          </span>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button v-if="!cfg.running" @click="control('start')" class="qb-btn qb-btn-primary">▶ 启动</button>
+          <button v-else @click="control('stop')" class="qb-btn qb-btn-danger">⏹ 停止</button>
+          <button @click="logout" class="qb-btn qb-btn-soft">退出</button>
+        </div>
       </div>
-      <div class="flex flex-wrap gap-2">
-        <button @click="tab='tg'" :class="tab==='tg'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">📱 登录与频道</button>
-        <button @click="tab='config'" :class="tab==='config'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">☁️ 网盘与存储</button>
-        <button @click="openNotify()" :class="tab==='notify'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">🔔 通知与日志</button>
-        <button @click="openPreview()" :class="tab==='preview'?'bg-blue-600':'bg-slate-800'" class="px-3 py-2 rounded-lg text-sm">🎬 预览库</button>
-        <button v-if="!cfg.running" @click="control('start')" class="bg-emerald-600 px-4 py-2 rounded-lg text-sm">▶ 启动</button>
-        <button v-else @click="control('stop')" class="bg-rose-600 px-4 py-2 rounded-lg text-sm">⏹ 停止</button>
-        <button @click="logout" class="bg-slate-700 px-3 py-2 rounded-lg text-sm">退出</button>
-      </div>
+      <nav class="qb-nav">
+        <button @click="tab='tg'" :class="tab==='tg'?'active':''" class="qb-nav-tab">📱 登录与频道</button>
+        <button @click="tab='config'" :class="tab==='config'?'active':''" class="qb-nav-tab">☁️ 网盘与存储</button>
+        <button @click="openNotify()" :class="tab==='notify'?'active':''" class="qb-nav-tab">🔔 通知与日志</button>
+        <button @click="openPreview()" :class="tab==='preview'?'active':''" class="qb-nav-tab">🎬 预览库</button>
+        <button @click="openSecurity()" :class="tab==='security'?'active':''" class="qb-nav-tab">⚙️ 安全设置</button>
+      </nav>
     </header>
 
     <!-- ==================== 登录与频道 ==================== -->
     <div v-if="tab==='tg'" class="space-y-6">
-      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
-        <h3 class="text-lg font-semibold mb-3">👤 TG 账号授权</h3>
+      <section class="qb-card accent-spring">
+        <div class="qb-card-title">👤 TG 账号授权</div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-          <input type="number" v-model.number="cfg.api_id" placeholder="API ID" class="bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-          <input v-model="cfg.api_hash" placeholder="API Hash" class="bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+          <input type="number" v-model.number="cfg.api_id" placeholder="API ID" class="qb-input">
+          <input v-model="cfg.api_hash" placeholder="API Hash" class="qb-input">
           <div class="flex space-x-2">
-            <input v-model="loginPhone" placeholder="+86..." class="flex-1 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-            <button @click="sendTgCode" class="bg-blue-600 px-3 py-2 rounded text-xs">发送验证码</button>
+            <input v-model="loginPhone" placeholder="+86..." class="qb-input">
+            <button @click="sendTgCode" class="qb-btn qb-btn-info">发送验证码</button>
           </div>
         </div>
-        <div v-if="codeSent" class="flex gap-2 items-center">
-          <input v-model="tgCode" placeholder="输入验证码" class="w-32 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-          <input v-if="need2FA" v-model="tg2FA" type="password" placeholder="2FA密码" class="w-40 bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-          <button @click="verifyTgCode" class="bg-emerald-600 px-4 py-2 rounded text-sm">确认登录</button>
+        <!-- 新增：Telegram 官方获取 API 的跳转 -->
+        <div class="qb-alert">
+          <div class="qb-alert-title">🔗 还没有 API ID / API Hash？</div>
+          <div>用 Telegram 手机号登录官方页面，创建应用后即可获取；API Hash 属于账号凭据，请勿分享给他人。</div>
+          <div class="qb-link-row">
+            <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer" class="qb-link">前往 my.telegram.org 获取 API →</a>
+            <a href="https://core.telegram.org/api/obtaining_api_id" target="_blank" rel="noopener noreferrer" class="qb-link qb-link-sub">📖 官方获取指南</a>
+          </div>
         </div>
-      </div>
+        <div v-if="codeSent" class="flex gap-2 items-center flex-wrap mt-4">
+          <input v-model="tgCode" placeholder="输入验证码" class="qb-input" style="width:150px">
+          <input v-if="need2FA" v-model="tg2FA" type="password" placeholder="2FA密码" class="qb-input" style="width:170px">
+          <button @click="verifyTgCode" class="qb-btn qb-btn-primary">确认登录</button>
+        </div>
+      </section>
+
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col h-[520px]">
-          <div class="flex justify-between items-center pb-2 border-b border-slate-700">
-            <h3 class="font-semibold">📡 已加入频道</h3>
-            <button @click="fetchDialogs" class="bg-indigo-600 px-3 py-1.5 rounded text-xs">刷新频道</button>
+        <section class="qb-card accent-mint flex flex-col h-[520px]">
+          <div class="flex justify-between items-center pb-2 border-b border-slate-200">
+            <span class="qb-card-title" style="margin-bottom:0">📡 已加入频道</span>
+            <button @click="fetchDialogs" class="qb-btn qb-btn-info qb-btn-sm">刷新频道</button>
           </div>
-          <input v-model="dialogSearch" placeholder="搜索..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 my-2 text-sm">
+          <input v-model="dialogSearch" placeholder="搜索..." class="qb-input my-2">
           <div class="flex-1 overflow-y-auto space-y-2">
-            <div v-for="d in filteredDialogs" :key="d.chat_id" class="flex justify-between items-center bg-slate-900 p-2.5 rounded border border-slate-700 text-sm">
+            <div v-for="d in filteredDialogs" :key="d.chat_id" class="qb-subcard flex justify-between items-center text-sm">
               <span class="truncate pr-2">{{ d.title }}</span>
-              <button @click="addChat(d)" class="bg-emerald-600 px-2.5 py-1 rounded text-xs whitespace-nowrap">+ 添加</button>
+              <button @click="addChat(d)" class="qb-btn qb-btn-primary qb-btn-sm">+ 添加</button>
             </div>
           </div>
-        </div>
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col h-[520px]">
-          <h3 class="font-semibold pb-2 border-b border-slate-700 mb-2">📥 监控队列 <span class="text-xs text-slate-400 font-normal">（每频道可指定存储目标）</span></h3>
+        </section>
+        <section class="qb-card accent-citrus flex flex-col h-[520px]">
+          <div class="qb-card-title pb-2 border-b border-slate-200">📥 监控队列 <span class="qb-hint">（每频道可指定存储目标）</span></div>
           <div class="flex-1 overflow-y-auto space-y-2">
-            <div v-for="(c, idx) in cfg.chats" :key="idx" class="bg-slate-900 p-2.5 rounded border border-slate-700 text-sm space-y-1">
-              <div class="flex justify-between">
-                <input v-model="c.title" class="bg-transparent text-blue-300 font-medium flex-1">
-                <button @click="cfg.chats.splice(idx,1)" class="text-rose-400 text-xs ml-2">删除</button>
+            <div v-for="(c, idx) in cfg.chats" :key="idx" class="qb-subcard space-y-1 text-sm">
+              <div class="flex justify-between items-center">
+                <input v-model="c.title" class="qb-input" style="border:none !important;background:transparent !important;font-weight:600;color:#2f6d8c !important">
+                <button @click="cfg.chats.splice(idx,1)" class="qb-btn qb-btn-danger qb-btn-sm ml-2">删除</button>
               </div>
-              <div class="grid grid-cols-3 gap-2 text-xs font-mono">
-                <input v-model="c.chat_id" placeholder="Chat ID" class="bg-slate-800 p-1 rounded col-span-1">
-                <input type="number" v-model.number="c.last_read_message_id" placeholder="起始ID" class="bg-slate-800 p-1 rounded col-span-1">
-                <select v-model="c.storage_id" class="bg-slate-800 p-1 rounded col-span-1 text-xs">
+              <div class="grid grid-cols-3 gap-2 text-xs">
+                <input v-model="c.chat_id" placeholder="Chat ID" class="qb-input">
+                <input type="number" v-model.number="c.last_read_message_id" placeholder="起始ID" class="qb-input">
+                <select v-model="c.storage_id" class="qb-input">
                   <option value="">📁 本地存储</option>
                   <option v-for="s in cfg.storages" :key="s.id" :value="s.id">☁️ {{ s.name }}</option>
                 </select>
               </div>
             </div>
           </div>
-          <button @click="saveConfig" class="mt-3 w-full bg-emerald-600 font-bold py-2.5 rounded">保存配置</button>
-        </div>
+          <button @click="saveConfig" class="qb-btn qb-btn-primary mt-3 w-full">保存配置</button>
+        </section>
       </div>
     </div>
 
     <!-- ==================== 网盘与存储 ==================== -->
     <div v-if="tab==='config'" class="space-y-6">
-      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-4">
-        <h3 class="text-lg font-semibold border-b border-slate-700 pb-2">📁 本地存储与归档规则</h3>
+      <section class="qb-card accent-mint space-y-4">
+        <div class="qb-section-title">📁 本地存储与归档规则</div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label class="text-xs text-slate-400">本地保存根目录（未配网盘的频道存这里）</label>
-            <input v-model="cfg.save_path" class="w-full bg-slate-900 border border-slate-700 rounded p-2 mt-1 text-sm">
+            <label class="qb-label">本地保存根目录（未配网盘的频道存这里）</label>
+            <input v-model="cfg.save_path" class="qb-input">
           </div>
           <div>
-            <label class="text-xs text-slate-400">自动归档结构预览</label>
-            <input disabled value="[save_path] / 频道名称 / YYYY-MM / 文件" class="w-full bg-slate-950 text-emerald-400 border border-slate-800 rounded p-2 mt-1 text-xs font-mono">
+            <label class="qb-label">自动归档结构预览</label>
+            <input disabled value="[save_path] / 频道名称 / YYYY-MM / 文件" class="qb-input" style="font-size:12px">
           </div>
         </div>
-      </div>
+      </section>
 
-      <!-- 多网盘管理 -->
-      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-4">
-        <div class="flex justify-between items-center border-b border-slate-700 pb-2">
-          <h3 class="text-lg font-semibold">☁️ 网盘管理 <span class="text-xs text-slate-400 font-normal">（支持添加多个网盘，频道可分别指定）</span></h3>
-          <button @click="addStorage" class="bg-emerald-600 px-3 py-1.5 rounded text-xs font-semibold">+ 添加网盘</button>
+      <section class="qb-card accent-spring space-y-4">
+        <div class="flex justify-between items-center flex-wrap gap-2 pb-2 border-b border-slate-200">
+          <div class="qb-section-title" style="margin-bottom:0">☁️ 网盘管理 <span class="qb-hint">（支持多个网盘，频道可分别指定）</span></div>
+          <button @click="addStorage" class="qb-btn qb-btn-primary qb-btn-sm">+ 添加网盘</button>
         </div>
-        <p class="text-xs text-slate-400 leading-relaxed bg-slate-900/60 p-3 rounded-lg">
+        <div class="qb-alert">
           ℹ️ 启动下载时，系统会按「频道 → 存储目标」自动分组，逐组生成独立配置并依次运行下载引擎；
           每组只上传到该组指定的网盘，未指定网盘的频道保留在本地。各组结束后水位线会自动回写，不会重复下载。
           <br>TGFS 需单独部署 WebDAV 服务并显式勾选上传授权才会参与自动上传，未授权时自动降级为本地存储。
-        </p>
+        </div>
 
-        <div v-if="!cfg.storages || cfg.storages.length === 0" class="text-center text-slate-500 py-8 text-sm">
+        <div v-if="!cfg.storages || cfg.storages.length === 0" class="text-center qb-hint py-8">
           暂未配置网盘。点击「添加网盘」开始配置 InfiniCLOUD / WebDAV / SMB / TGFS 存储目标。
         </div>
 
-        <div v-for="(s, idx) in cfg.storages" :key="idx" class="bg-slate-900 p-4 rounded-lg border space-y-3" :class="s.type==='tgfs' ? 'border-amber-600/70' : 'border-slate-700'">
-          <div class="flex justify-between items-center">
-            <input v-model="s.name" placeholder="网盘名称（如：我的InfiniCLOUD）" class="bg-transparent text-blue-300 font-semibold flex-1 text-sm">
-            <div class="flex gap-2 ml-2">
-              <button @click="testStorage(s.id)" class="bg-indigo-600 px-3 py-1 rounded text-xs">⚡ 测试</button>
-              <button @click="cfg.storages.splice(idx,1)" class="bg-rose-600 px-3 py-1 rounded text-xs">删除</button>
+        <div v-for="(s, idx) in cfg.storages" :key="idx" class="qb-subcard space-y-3">
+          <div class="flex justify-between items-center flex-wrap gap-2">
+            <input v-model="s.name" placeholder="网盘名称（如：我的InfiniCLOUD）" class="qb-input" style="flex:1;min-width:220px;border:none !important;background:transparent !important;font-weight:600;color:#2f6d8c !important">
+            <div class="flex gap-2">
+              <button @click="testStorage(s.id)" class="qb-btn qb-btn-info qb-btn-sm">⚡ 测试</button>
+              <button @click="cfg.storages.splice(idx,1)" class="qb-btn qb-btn-danger qb-btn-sm">删除</button>
             </div>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
-            <select v-model="s.type" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+            <select v-model="s.type" class="qb-input">
               <option value="infinicloud">InfiniCLOUD</option>
               <option value="webdav">WebDAV</option>
               <option value="smb">SMB</option>
               <option value="tgfs">TGFS（独立 WebDAV 网关）</option>
             </select>
-            <input v-model="s.url" :placeholder="storageUrlPlaceholder(s)" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm col-span-2">
-            <input v-model="s.remote_dir" placeholder="远程目录(如 tg_backup)" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+            <input v-model="s.url" :placeholder="storageUrlPlaceholder(s)" class="qb-input md:col-span-2">
+            <input v-model="s.remote_dir" placeholder="远程目录(如 tg_backup)" class="qb-input">
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-            <input v-model="s.user" placeholder="用户名 / User ID" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
-            <input v-model="s.pass" :type="s._showPass ? 'text' : 'password'" :placeholder="s.has_pass ? '已配置（留空保持不变）' : '密码 / Apps Password'" class="bg-slate-800 border border-slate-700 rounded p-2 text-sm">
+            <input v-model="s.user" placeholder="用户名 / User ID" class="qb-input">
+            <input v-model="s.pass" :type="s._showPass ? 'text' : 'password'" :placeholder="s.has_pass ? '已配置（留空保持不变）' : '密码 / Apps Password'" class="qb-input">
           </div>
 
           <!-- TGFS 分支：只读探测 + 显式上传授权 -->
-          <div v-if="s.type==='tgfs'" class="bg-amber-950/40 border border-amber-700/60 rounded-lg p-3 space-y-2 text-xs text-amber-200">
-            <p class="leading-relaxed">
+          <div v-if="s.type==='tgfs'" class="qb-alert warn space-y-2">
+            <p>
               ⚠️ TGFS 通过 Rclone 的 <b>webdav</b> 后端接入（Rclone 没有名为 tgfs 的驱动）。请填写<b>已单独部署</b>的 TGFS WebDAV Endpoint 完整地址，
-              例如内网 <code class="text-amber-300">http://tgfs:8080/webdav</code> 或 <code class="text-amber-300">http://192.168.x.x:PORT/webdav</code>。
+              例如内网 <code>http://tgfs:8080/webdav</code> 或 <code>http://192.168.x.x:PORT/webdav</code>。
               公网地址必须使用 HTTPS；URL 内不得夹带账号、密码、查询串或片段。
             </p>
-            <p class="leading-relaxed">
-              仅用于经授权的测试或媒体存储。连接测试执行只读列目录（lsd），<b>不会创建目录或写入文件</b>；容量固定显示「未知」。
-            </p>
-            <label class="flex items-start gap-2 font-semibold text-amber-100">
+            <p>仅用于经授权的测试或媒体存储。连接测试执行只读列目录（lsd），<b>不会创建目录或写入文件</b>；容量固定显示「未知」。</p>
+            <label class="flex items-start gap-2 font-semibold">
               <input type="checkbox" v-model="s.upload_authorized" class="w-4 h-4 mt-0.5 shrink-0">
               <span>我已确认来源合规并显式授权：允许把指向该 TGFS 的频道文件上传到此存储</span>
             </label>
-            <p v-if="!s.upload_authorized" class="text-amber-300">
-              当前为只读模式：即使频道选择了该网盘，下载结果也会保留在本地，不会自动上传。
-            </p>
+            <p v-if="!s.upload_authorized">当前为只读模式：即使频道选择了该网盘，下载结果也会保留在本地，不会自动上传。</p>
             <div class="flex flex-wrap items-center gap-2 pt-1">
-              <button @click="testTGFS(s.id)" class="bg-indigo-600 px-3 py-1.5 rounded text-xs font-semibold">🔎 测试 TGFS 连接（只读）</button>
-              <span v-if="!s.id" class="text-amber-300">新增网盘请先保存配置再测试</span>
+              <button @click="testTGFS(s.id)" class="qb-btn qb-btn-info qb-btn-sm">🔎 测试 TGFS 连接（只读）</button>
+              <span v-if="!s.id" class="qb-hint">新增网盘请先保存配置再测试</span>
             </div>
           </div>
         </div>
 
         <div v-if="cfg.storages && cfg.storages.length > 0" class="flex items-center gap-4 pt-2">
-          <label class="flex items-center gap-2 text-sm text-slate-300">
+          <label class="flex items-center gap-2 text-sm">
             <input type="checkbox" v-model="cfg.delete_after_upload" class="w-4 h-4">
             上传后删除本地文件
           </label>
         </div>
-      </div>
+      </section>
 
-      <!-- 存储路由总览 -->
-      <div v-if="cfg.chats && cfg.chats.length > 0" class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
-        <h3 class="text-lg font-semibold border-b border-slate-700 pb-2">🗺️ 存储路由总览</h3>
+      <section v-if="cfg.chats && cfg.chats.length > 0" class="qb-card accent-peach space-y-3">
+        <div class="qb-section-title">🗺️ 存储路由总览</div>
         <div class="space-y-1.5">
-          <div v-for="c in cfg.chats" :key="c.chat_id" class="flex items-center justify-between bg-slate-900 p-2 rounded text-sm">
-            <span class="text-blue-300">{{ c.title || c.chat_id }}</span>
-            <span class="text-xs">
-              <span v-if="!c.storage_id" class="text-slate-400">📁 本地存储</span>
-              <span v-else class="text-emerald-400">☁️ {{ storageName(c.storage_id) }}</span>
+          <div v-for="c in cfg.chats" :key="c.chat_id" class="qb-subcard flex items-center justify-between text-sm">
+            <span style="color:#2f6d8c">{{ c.title || c.chat_id }}</span>
+            <span class="qb-hint">
+              <span v-if="!c.storage_id">📁 本地存储</span>
+              <span v-else>☁️ {{ storageName(c.storage_id) }}</span>
             </span>
           </div>
         </div>
-      </div>
+      </section>
 
-      <button @click="saveConfig" class="w-full bg-emerald-600 font-bold py-3 rounded-xl">💾 保存全部配置</button>
+      <button @click="saveConfig" class="qb-btn qb-btn-primary w-full" style="padding:13px">💾 保存全部配置</button>
+    </div>
+
+    <!-- ==================== 安全设置（新增：OTP 换绑） ==================== -->
+    <div v-if="tab==='security'" class="space-y-6">
+      <section class="qb-card accent-berry">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>🔐 动态口令（TOTP）换绑</span>
+          <span class="qb-tag" :class="otp.source==='custom' ? 'qb-tag-warn' : 'qb-tag-info'">
+            当前来源：{{ otp.source==='custom' ? '自定义密钥（已换绑）' : '环境变量 OTP_SECRET' }}
+          </span>
+        </div>
+        <div class="qb-alert">
+          <div class="qb-alert-title">两阶段确认，不会把自己锁在门外</div>
+          <div>先输入当前验证器的 6 位口令 → 用新验证器扫描二维码 → 输入新口令确认。确认之前旧口令一直有效；
+          换绑成功后密钥持久化保存（权限 600），容器重建也不会丢失。日志不记录任何密钥。</div>
+        </div>
+
+        <!-- 步骤 1：验证当前口令 -->
+        <div v-if="otp.step===1" style="margin-top:18px">
+          <label class="qb-label">① 输入当前验证器的 6 位动态口令</label>
+          <div class="flex flex-wrap gap-2 items-center">
+            <input v-model="otpCurrentCode" maxlength="6" inputmode="numeric" placeholder="000000" @keyup.enter="beginOtpRebind" class="qb-input qb-code-input">
+            <button @click="beginOtpRebind" :disabled="otpBusy" class="qb-btn qb-btn-primary">生成新密钥</button>
+            <span class="qb-hint">需先证明你持有当前验证器</span>
+          </div>
+        </div>
+
+        <!-- 步骤 2：扫码 + 新码确认 -->
+        <div v-if="otp.step===2" style="margin-top:18px">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label class="qb-label">② 用验证器扫描二维码</label>
+              <div id="otp-qr" class="qb-qr"></div>
+              <p class="qb-hint" style="margin-top:8px">支持 Google / Microsoft Authenticator、1Password 等标准 TOTP 应用</p>
+            </div>
+            <div class="space-y-4">
+              <div>
+                <label class="qb-label">手动录入密钥（Base32）</label>
+                <div class="flex gap-2 items-center flex-wrap">
+                  <code class="qb-code">{{ otpNewSecret }}</code>
+                  <button @click="copyText(otpNewSecret)" class="qb-btn qb-btn-soft qb-btn-sm">复制</button>
+                </div>
+              </div>
+              <div>
+                <label class="qb-label">③ 输入新验证器的 6 位口令以确认换绑</label>
+                <div class="flex flex-wrap gap-2 items-center">
+                  <input v-model="otpNewCode" maxlength="6" inputmode="numeric" placeholder="000000" @keyup.enter="confirmOtpRebind" class="qb-input qb-code-input">
+                  <button @click="confirmOtpRebind" :disabled="otpBusy" class="qb-btn qb-btn-primary">确认换绑</button>
+                  <button @click="cancelOtpRebind(false)" class="qb-btn qb-btn-soft">取消</button>
+                </div>
+              </div>
+              <div class="qb-alert warn">⏳ 本次换绑会话剩余 {{ otpCountdown }} 秒，超时自动作废，旧口令继续有效。</div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="otpMsg" class="qb-msg" :class="otpMsgOk ? 'ok' : 'err'">{{ otpMsg }}</div>
+
+        <div class="qb-divider"></div>
+        <div class="flex flex-wrap gap-2 items-center">
+          <button @click="otp.resetOpen = !otp.resetOpen" class="qb-btn qb-btn-warn qb-btn-sm">↩ 恢复为环境变量密钥</button>
+          <span class="qb-hint">清除自定义密钥，回到部署时配置的 OTP_SECRET</span>
+        </div>
+        <div v-if="otp.resetOpen" class="qb-inline-form">
+          <input v-model="otpResetCode" maxlength="6" inputmode="numeric" placeholder="当前 6 位口令" class="qb-input qb-code-input">
+          <button @click="resetOtpToEnv" class="qb-btn qb-btn-warn">确认恢复</button>
+          <button @click="otp.resetOpen=false" class="qb-btn qb-btn-soft">取消</button>
+        </div>
+      </section>
+
+      <section class="qb-card accent-citrus">
+        <div class="qb-section-title">🛡️ 安全说明</div>
+        <ul class="qb-list">
+          <li>密钥仅保存在服务端持久化目录，文件权限 600，不会写入日志或前端配置文件。</li>
+          <li>二维码由浏览器本地生成，密钥不会发送给任何第三方二维码服务。</li>
+          <li>换绑不会让当前登录态失效；从下次登录起使用新口令，请保留新验证器条目。</li>
+          <li>若改用环境变量密钥，需在所有已绑定设备上重新导入原来的验证器条目。</li>
+        </ul>
+      </section>
     </div>
 
     <!-- ==================== 通知与日志 ==================== -->
     <div v-if="tab==='notify'" class="space-y-6">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
-          <div class="flex justify-between items-center"><h3 class="font-semibold">🐦 飞书通知</h3><input type="checkbox" v-model="cfg.feishu_enable"></div>
-          <input v-model="cfg.feishu_webhook" placeholder="Webhook URL" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-        </div>
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 space-y-3">
-          <div class="flex justify-between items-center"><h3 class="font-semibold">🤖 TG Bot 通知</h3><input type="checkbox" v-model="cfg.tgbot_enable"></div>
-          <input v-model="cfg.tgbot_token" placeholder="Bot Token" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-          <input v-model="cfg.tgbot_chat_id" placeholder="Chat ID" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-        </div>
+        <section class="qb-card accent-peach space-y-3">
+          <div class="flex justify-between items-center"><div class="qb-card-title" style="margin-bottom:0">🐦 飞书通知</div><input type="checkbox" v-model="cfg.feishu_enable" class="w-4 h-4"></div>
+          <input v-model="cfg.feishu_webhook" placeholder="Webhook URL" class="qb-input">
+        </section>
+        <section class="qb-card accent-mint space-y-3">
+          <div class="flex justify-between items-center"><div class="qb-card-title" style="margin-bottom:0">🤖 TG Bot 通知</div><input type="checkbox" v-model="cfg.tgbot_enable" class="w-4 h-4"></div>
+          <input v-model="cfg.tgbot_token" placeholder="Bot Token" class="qb-input">
+          <input v-model="cfg.tgbot_chat_id" placeholder="Chat ID" class="qb-input">
+        </section>
       </div>
-      <div class="flex space-x-3">
-        <button @click="testNotify" class="bg-indigo-600 px-4 py-2 rounded text-sm">📨 发送测试通知</button>
-        <button @click="saveConfig" class="bg-emerald-600 px-5 py-2 rounded text-sm font-bold">💾 保存通知配置</button>
+      <div class="flex space-x-3 flex-wrap gap-2">
+        <button @click="testNotify" class="qb-btn qb-btn-info">📨 发送测试通知</button>
+        <button @click="saveConfig" class="qb-btn qb-btn-primary">💾 保存通知配置</button>
       </div>
-      <div class="bg-slate-950 p-4 rounded-xl border border-slate-800">
-        <div class="flex justify-between items-center mb-2"><span class="text-xs font-mono text-slate-400">🖥️ 实时日志输出</span><button @click="fetchLogs" class="text-xs bg-slate-800 px-3 py-1 rounded">刷新</button></div>
-        <div class="h-64 overflow-y-auto font-mono text-xs text-emerald-400 space-y-1 p-2 bg-black/50 rounded">
+      <section class="qb-card accent-berry">
+        <div class="flex justify-between items-center mb-2"><span class="qb-card-title" style="margin-bottom:0">🖥️ 实时日志输出</span><button @click="fetchLogs" class="qb-btn qb-btn-soft qb-btn-sm">刷新</button></div>
+        <div class="qb-log h-64 overflow-y-auto">
           <div v-for="(l, i) in logs" :key="i">{{ l }}</div>
         </div>
-      </div>
+      </section>
     </div>
 
     <!-- ==================== 预览库 ==================== -->
     <div v-if="tab==='preview'">
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div v-for="item in mediaList" :key="item.rel_path" class="bg-slate-800 rounded-xl overflow-hidden border border-slate-700 flex flex-col">
-          <div class="h-48 bg-black flex items-center justify-center">
+        <div v-for="item in mediaList" :key="item.rel_path" class="qb-card" style="padding:0">
+          <div class="h-48 bg-black flex items-center justify-center" style="border-radius:18px 18px 0 0;overflow:hidden">
             <img v-if="item.type==='image'" :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" class="object-cover w-full h-full">
             <video v-else :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" controls class="w-full h-full"></video>
           </div>
@@ -241,7 +477,12 @@ createApp({
       authed: false, otpCode: '', errMsg: '', tab: 'tg',
       cfg: { file_path_prefix: ['chat_title', 'media_datetime'], media_types: ['photo', 'video'], chats: [], storages: [] },
       tgStatus: { logged_in: false }, loginPhone: '', codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
-      dialogs: [], dialogSearch: '', logs: [], mediaList: []
+      dialogs: [], dialogSearch: '', logs: [], mediaList: [],
+      // OTP 换绑状态
+      otp: { source: 'env', step: 1, resetOpen: false },
+      otpCurrentCode: '', otpNewCode: '', otpNewSecret: '', otpNewUri: '',
+      otpResetCode: '', otpBusy: false, otpMsg: '', otpMsgOk: true,
+      otpCountdown: 0, otpTimer: null
     }
   },
   computed: {
@@ -254,7 +495,7 @@ createApp({
   methods: {
     async doLogin() {
       const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ otp_code: this.otpCode }) });
-      if (res.ok) this.fetchConfig(); else this.errMsg = '验证码错误';
+      if (res.ok) { this.errMsg = ''; this.fetchConfig(); } else this.errMsg = '验证码错误，请重试';
     },
     async logout() { await fetch('/api/logout', { method: 'POST' }); this.authed = false; },
     async fetchConfig() {
@@ -302,7 +543,6 @@ createApp({
       return 'SMB主机IP';
     },
     async saveConfig() {
-      // 清理前端临时字段（has_pass / _showPass 不回传后端）
       const payload = JSON.parse(JSON.stringify(this.cfg));
       if (payload.storages) {
         payload.storages.forEach(s => { delete s.has_pass; delete s._showPass; });
@@ -315,7 +555,6 @@ createApp({
         return;
       }
       const data = await res.json().catch(() => ({}));
-      // 必须以后端返回为准，不能无条件提示「已保存」
       if (res.ok && data.status === 'saved') { alert('配置已保存！共 ' + data.storages_count + ' 个存储目标'); this.fetchConfig(); }
       else alert('保存失败：' + (data.detail || '未知错误'));
     },
@@ -342,7 +581,89 @@ createApp({
     async testNotify() { const r = await fetch('/api/test_notify', { method: 'POST' }); alert((await r.json()).msg); },
     async fetchLogs() { const r = await fetch('/api/logs'); if(r.ok) { const d = await r.json(); this.logs = d.logs; this.cfg.running = d.running; } },
     async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
-    async loadMedia() { const r = await fetch('/api/media'); if(r.ok) this.mediaList = await r.json(); }
+    async loadMedia() { const r = await fetch('/api/media'); if(r.ok) this.mediaList = await r.json(); },
+
+    // ==================== 安全设置：OTP 换绑 ====================
+    async apiPost(path, body) {
+      const r = await fetch(path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { ok: r.ok, d: await r.json().catch(() => ({})) };
+    },
+    setOtpMsg(text, ok) { this.otpMsg = text; this.otpMsgOk = !!ok; },
+    async openSecurity() { this.tab = 'security'; await this.fetchOtpStatus(); },
+    async fetchOtpStatus() {
+      const r = await fetch('/api/security/otp');
+      if (r.ok) { const d = await r.json(); this.otp.source = d.source; }
+    },
+    stopOtpCountdown() { if (this.otpTimer) { clearInterval(this.otpTimer); this.otpTimer = null; } },
+    startOtpCountdown(sec) {
+      this.stopOtpCountdown();
+      this.otpCountdown = sec;
+      this.otpTimer = setInterval(() => {
+        this.otpCountdown = Math.max(0, this.otpCountdown - 1);
+        if (this.otpCountdown === 0) { this.stopOtpCountdown(); this.cancelOtpRebind(true); }
+      }, 1000);
+    },
+    async beginOtpRebind() {
+      if (!/^\d{6}$/.test(this.otpCurrentCode)) { this.setOtpMsg('请输入当前验证器的 6 位数字口令', false); return; }
+      this.otpBusy = true;
+      const r = await this.apiPost('/api/security/otp/begin', { current_code: this.otpCurrentCode });
+      this.otpBusy = false;
+      if (!r.ok) { this.setOtpMsg(r.d.detail || '验证失败', false); return; }
+      this.otpNewSecret = r.d.secret; this.otpNewUri = r.d.uri; this.otpNewCode = '';
+      this.otp.step = 2;
+      this.setOtpMsg('新密钥已生成，请用验证器扫码后输入新口令确认', true);
+      this.startOtpCountdown(r.d.expires_in || 300);
+      this.$nextTick(() => this.renderQr());
+    },
+    renderQr() {
+      const box = document.getElementById('otp-qr');
+      if (!box) return;
+      if (typeof qrcode !== 'function') { box.innerHTML = '<div class="qb-qr-fallback">扫码组件不可用，请手动录入密钥</div>'; return; }
+      try {
+        const qr = qrcode(0, 'M'); qr.addData(this.otpNewUri); qr.make();
+        box.innerHTML = qr.createImgTag(4, 8);
+        const img = box.querySelector('img');
+        if (img) { img.style.width = '168px'; img.style.height = '168px'; img.alt = 'TOTP 二维码'; }
+      } catch (e) { box.innerHTML = '<div class="qb-qr-fallback">二维码生成失败，请手动录入密钥</div>'; }
+    },
+    async confirmOtpRebind() {
+      if (!/^\d{6}$/.test(this.otpNewCode)) { this.setOtpMsg('请输入新验证器的 6 位数字口令', false); return; }
+      this.otpBusy = true;
+      const r = await this.apiPost('/api/security/otp/confirm', { code: this.otpNewCode });
+      this.otpBusy = false;
+      if (!r.ok) { this.setOtpMsg(r.d.detail || '确认失败', false); return; }
+      this.stopOtpCountdown();
+      this.otp.source = 'custom'; this.otp.step = 1;
+      this.otpCurrentCode = ''; this.otpNewCode = ''; this.otpNewSecret = ''; this.otpNewUri = '';
+      const box = document.getElementById('otp-qr'); if (box) box.innerHTML = '';
+      this.setOtpMsg('换绑成功！下次登录请使用新的动态口令，请妥善保存新验证器条目。', true);
+    },
+    async cancelOtpRebind(silent) {
+      this.stopOtpCountdown();
+      await this.apiPost('/api/security/otp/cancel');
+      this.otp.step = 1; this.otpNewCode = ''; this.otpNewSecret = ''; this.otpNewUri = '';
+      const box = document.getElementById('otp-qr'); if (box) box.innerHTML = '';
+      this.setOtpMsg(silent === true ? '换绑会话已超时，当前口令保持不变' : '已取消换绑，当前口令保持不变', silent !== true);
+    },
+    async resetOtpToEnv() {
+      if (!/^\d{6}$/.test(this.otpResetCode)) { this.setOtpMsg('请输入当前 6 位口令', false); return; }
+      const r = await this.apiPost('/api/security/otp/reset', { code: this.otpResetCode });
+      if (!r.ok) { this.setOtpMsg(r.d.detail || '恢复失败', false); return; }
+      this.otp.source = 'env'; this.otp.resetOpen = false; this.otpResetCode = '';
+      this.setOtpMsg('已恢复为环境变量密钥，请用原来的验证器重新绑定', true);
+    },
+    copyText(text) {
+      const done = () => this.setOtpMsg('密钥已复制到剪贴板', true);
+      const fail = () => this.setOtpMsg('复制失败，请手动选中密钥复制', false);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(fail);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch (e) { fail(); }
+        document.body.removeChild(ta);
+      }
+    }
   }
 }).mount('#app');
 </script>
