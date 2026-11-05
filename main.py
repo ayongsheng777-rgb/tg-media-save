@@ -1575,6 +1575,377 @@ def test_tgfs_endpoint(req: Optional[TestTGFSReq] = None):
     return {"ok": True, "message": result["msg"]}
 
 
+# ==================== TGFS 集成（面板内配置 + 代管 TGFS 容器）====================
+#
+# 官方 TGFS（github.com/TheodoreKrypton/tgfs）把 Telegram 私有频道当网盘，
+# 对外提供 WebDAV。以前面板只支持「你自己去别处部署好，再把地址填进来」；
+# 现在面板直接代管：生成它的 config.yaml、通过 Docker API 启停 tgfs 容器、
+# 并自动把它的 WebDAV 挂成一个存储目标，用户不用再碰命令行。
+#
+# 几个绕不开的事实（都是实测/读源码确认的，改动前先看这里）：
+#   * WebDAV 根下按 metadata.name 分一级目录，所以 rclone 的 remote_dir 是 `tgfs`，
+#     完整路径是 /webdav/tgfs/...
+#   * `private_file_channel` 必须是**列表**，`metadata` 必须是「channel_id -> 配置」
+#     的映射；README 里的 demo-config.yaml 是旧格式，照抄会 KeyError。
+#   * `metadata.type` 用 pinned_message 即可，不需要 GitHub 仓库和 token。
+#   * 官方代码的 Pyrogram Client 不支持 proxy，境内直连 Telegram 必超时 ——
+#     tgfs_patch/sitecustomize.py 会在容器里自动注入代理，不改它的源码。
+
+TGFS_LOCAL_DIR = Path("/app/tgfs_data")          # 与 tgfs 容器的 /data 是同一个卷
+TGFS_CONF_PATH = TGFS_LOCAL_DIR / "config.yaml"
+TGFS_CONTAINER = "tgfs"                          # 唯一允许操作的容器
+TGFS_DEFAULT_PORT = 1900
+TGFS_WEBDAV_PATH = "/webdav"
+TGFS_META_NAME = "tgfs"                          # WebDAV 根下的一级目录 = metadata.name
+TGFS_HOST_ALIAS = "host.docker.internal"         # tgfs 跑 host 网络，面板经此访问
+DOCKER_SOCK = "/var/run/docker.sock"
+
+
+def _tgfs_docker(action: str, timeout: float = 40.0):
+    """对 tgfs 容器执行 start / stop / restart。
+
+    面板一旦挂上 docker.sock 就等于有 root 权限，所以这里**不接受任何外部输入
+    拼进 URL**：action 只认三个字面量，容器名硬编码。
+    """
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=500, detail="内部错误：非法的容器操作")
+    if not os.path.exists(DOCKER_SOCK):
+        raise HTTPException(
+            status_code=503,
+            detail="面板没有挂载 docker.sock，无法直接控制 TGFS 容器。"
+                   "请在 docker-compose.yml 里挂载 /var/run/docker.sock 后重建面板容器。",
+        )
+    try:
+        transport = httpx.HTTPTransport(uds=DOCKER_SOCK)
+        with httpx.Client(transport=transport, base_url="http://docker",
+                          timeout=httpx.Timeout(timeout)) as c:
+            return c.post(f"/containers/{TGFS_CONTAINER}/{action}",
+                          params={"t": 15} if action in ("stop", "restart") else None)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"Docker API 调用失败：{exc}") from exc
+
+
+def _tgfs_container_state() -> dict:
+    if not os.path.exists(DOCKER_SOCK):
+        return {"exists": False, "running": False, "status": "no-docker-sock"}
+    try:
+        transport = httpx.HTTPTransport(uds=DOCKER_SOCK)
+        with httpx.Client(transport=transport, base_url="http://docker",
+                          timeout=httpx.Timeout(10.0)) as c:
+            r = c.get(f"/containers/{TGFS_CONTAINER}/json")
+    except httpx.HTTPError as exc:
+        return {"exists": False, "running": False, "status": f"docker-error: {exc}"}
+    if r.status_code == 404:
+        return {"exists": False, "running": False, "status": "not-created"}
+    if r.status_code != 200:
+        return {"exists": False, "running": False, "status": f"error {r.status_code}"}
+    state = (r.json() or {}).get("State") or {}
+    return {
+        "exists": True,
+        "running": bool(state.get("Running")),
+        "status": state.get("Status") or "unknown",
+        "exit_code": state.get("ExitCode"),
+        "started_at": (state.get("StartedAt") or "")[:19],
+    }
+
+
+def _tgfs_webdav_probe(port: int, user: str, password: str) -> dict:
+    """对 WebDAV 根发一次 PROPFIND，确认它真的能用（而不只是端口活着）。
+
+    用 host.docker.internal 而不是 127.0.0.1：tgfs 在 host 网络，面板在桥接网络，
+    面板里的 127.0.0.1 是它自己。
+    """
+    url = f"http://{TGFS_HOST_ALIAS}:{port}{TGFS_WEBDAV_PATH}/"
+    try:
+        with httpx.Client(timeout=httpx.Timeout(8.0), trust_env=False) as c:
+            r = c.request("PROPFIND", url, headers={"Depth": "0"},
+                          auth=(user or "", password or ""))
+    except httpx.HTTPError as exc:
+        return {"ok": False, "status": 0, "msg": f"连不上：{type(exc).__name__}"}
+    if r.status_code == 207:
+        return {"ok": True, "status": 207, "msg": "WebDAV 可用"}
+    if r.status_code == 401:
+        return {"ok": False, "status": 401, "msg": "WebDAV 在，但用户名或密码不对"}
+    return {"ok": False, "status": r.status_code, "msg": f"WebDAV 返回 HTTP {r.status_code}"}
+
+
+def _suggest_tgfs_proxy() -> str:
+    """把面板已配的代理翻译成 TGFS 能用的地址。
+
+    TGFS 跑在 host 网络，所以容器网关那种 172.x.0.1 要换回 127.0.0.1。
+    """
+    conf = load_config().get("proxy") or {}
+    if not conf.get("hostname"):
+        return ""
+    host = conf["hostname"]
+    if host.startswith("172.") and host.endswith(".0.1"):
+        host = "127.0.0.1"
+    scheme = conf.get("scheme") or "socks5"
+    auth = ""
+    if conf.get("username"):
+        # 代理密码常含 @ : 等字符，必须百分号编码，否则会被当成 host 的一部分
+        auth = f"{quote(conf['username'], safe='')}:{quote(conf.get('password', ''), safe='')}@"
+    return f"{scheme}://{auth}{host}:{conf.get('port') or 1080}"
+
+
+def build_tgfs_config(t: dict) -> dict:
+    """把面板里的字段翻译成 TGFS 的 config.yaml 结构。"""
+    channel = str(t.get("channel") or "").strip()
+    cfg = {
+        "telegram": {
+            "api_id": int(t.get("api_id") or 0),
+            "api_hash": str(t.get("api_hash") or "").strip(),
+            "bot": {
+                "session_file": "bot.session",
+                "tokens": [str(t.get("bot_token") or "").strip()],
+            },
+            "private_file_channel": [channel],
+            "lib": "pyrogram",
+        },
+        "tgfs": {
+            "users": {
+                (str(t.get("username") or "").strip() or "admin"): {
+                    "password": t.get("password") or "",
+                    "readonly": bool(t.get("readonly")),
+                }
+            },
+            "download": {"chunk_size_kb": 1024},
+            "jwt": {
+                "secret": t.get("jwt_secret") or "",
+                "algorithm": "HS256",
+                "life": 604800,
+            },
+            "metadata": {
+                channel: {"name": TGFS_META_NAME, "type": "pinned_message"}
+            },
+            "server": {
+                "host": "0.0.0.0",
+                "port": int(t.get("port") or TGFS_DEFAULT_PORT),
+            },
+        },
+    }
+    proxy = (t.get("proxy") or "").strip()
+    if proxy:
+        cfg["telegram"]["proxy"] = proxy
+    return cfg
+
+
+def write_tgfs_config(t: dict):
+    TGFS_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = TGFS_CONF_PATH.with_suffix(".yaml.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        _yaml_dump(build_tgfs_config(t), f)
+        f.flush()
+        os.fsync(f.fileno())
+    # 644 而不是 600：tgfs 容器里是非 root 用户（uid 1000 的 tgfs）在读这份文件，
+    # root:root 600 它会直接 Permission denied。目录本身在宿主私有目录下。
+    try:
+        os.chmod(tmp, 0o644)
+    except OSError:
+        pass
+    os.replace(tmp, TGFS_CONF_PATH)
+
+
+def sync_tgfs_storage(cfg: dict, t: dict) -> str:
+    """把面板代管的 TGFS 同步成一条 storage，返回它的 sid。
+
+    用 _ui_tgfs.storage_id 记住自己那条，避免每次保存都新建一条。
+    """
+    port = int(t.get("port") or TGFS_DEFAULT_PORT)
+    sid = (t.get("storage_id") or "").strip() or str(uuid.uuid4())[:8]
+    storages = list(cfg.get("_ui_storages") or [])
+    entry = next((s for s in storages if s.get("id") == sid), None)
+    if entry is None:
+        entry = {"id": sid}
+        storages.append(entry)
+    entry.update({
+        "id": sid,
+        "name": t.get("storage_name") or "TGFS",
+        "type": "tgfs",
+        "url": f"http://{TGFS_HOST_ALIAS}:{port}{TGFS_WEBDAV_PATH}",
+        "user": str(t.get("username") or "").strip() or "admin",
+        "remote_dir": TGFS_META_NAME,
+        # 用户是在面板里主动配的 TGFS，视为已显式授权自动上传
+        "upload_authorized": True,
+        "_managed_by": "tgfs",
+    })
+    cfg["_ui_storages"] = storages
+    return sid
+
+
+class TGFSConfigReq(BaseModel):
+    api_id: int
+    api_hash: str
+    bot_token: str = ""
+    channel: str
+    username: str = "admin"
+    password: str = ""
+    readonly: bool = False
+    port: int = TGFS_DEFAULT_PORT
+    proxy: str = ""
+    storage_name: str = "TGFS"
+    restart: bool = True
+
+
+@app.get("/api/tgfs/status", dependencies=[Depends(verify_auth)])
+def tgfs_status():
+    cfg = load_config()
+    t = cfg.get("_ui_tgfs") or {}
+    port = int(t.get("port") or TGFS_DEFAULT_PORT)
+    user = str(t.get("username") or "").strip() or "admin"
+    conf_exists = TGFS_CONF_PATH.exists()
+    state = _tgfs_container_state()
+    webdav = {"ok": False, "status": 0, "msg": "未运行"}
+    if state.get("running"):
+        webdav = _tgfs_webdav_probe(port, user, t.get("password") or "")
+    return {
+        "configured": bool(t.get("bot_token") and t.get("channel") and t.get("api_hash")),
+        "api_id": int(t.get("api_id") or cfg.get("api_id") or 0),
+        "api_hash": t.get("api_hash") or cfg.get("api_hash") or "",
+        "has_bot_token": bool(t.get("bot_token")),
+        "channel": t.get("channel") or "",
+        "username": user,
+        "has_password": bool(t.get("password")),
+        "readonly": bool(t.get("readonly")),
+        "port": port,
+        "proxy": t.get("proxy") or "",
+        "suggest_proxy": _suggest_tgfs_proxy(),
+        "storage_id": t.get("storage_id") or "",
+        "storage_name": t.get("storage_name") or "TGFS",
+        "conf_exists": conf_exists,
+        "conf_path": str(TGFS_CONF_PATH),
+        "docker_ok": os.path.exists(DOCKER_SOCK),
+        "container": state,
+        "webdav": webdav,
+        "url": f"http://{TGFS_HOST_ALIAS}:{port}{TGFS_WEBDAV_PATH}",
+    }
+
+
+@app.post("/api/tgfs/config", dependencies=[Depends(verify_auth)])
+def tgfs_save_config(req: TGFSConfigReq):
+    """保存 TGFS 配置：写 config.yaml → 同步存储目标 → 重启容器。"""
+    cfg = load_config()
+    old = dict(cfg.get("_ui_tgfs") or {})
+    # Token / 密码框留空都表示沿用已保存的值（前端不回显这两项）
+    bot_token = (req.bot_token or "").strip() or (old.get("bot_token") or "")
+    api_hash = (req.api_hash or "").strip() or (old.get("api_hash") or "")
+    channel = str(req.channel or "").strip()
+    username = (req.username or "").strip() or "admin"
+    password = req.password or old.get("password", "")
+
+    if not req.api_id or not api_hash:
+        raise HTTPException(status_code=422, detail="api_id / api_hash 不能为空（可用「登录与频道」里已填的那组）")
+    if not channel:
+        raise HTTPException(status_code=422, detail="请填写用作存储的 Telegram 频道 ID 或 @username")
+    if ":" not in bot_token:
+        raise HTTPException(status_code=422,
+                            detail="请填写 Bot Token，格式为「数字:字母串」，形如 123456789:AAxxxx")
+    if not password:
+        raise HTTPException(status_code=422, detail="请设置 WebDAV 密码，否则 TGFS 会拒绝所有连接")
+
+    t = {
+        "api_id": int(req.api_id),
+        "api_hash": api_hash,
+        "bot_token": bot_token,
+        "password": password,
+        "channel": channel,
+        "username": username,
+        "readonly": bool(req.readonly),
+        "port": int(req.port or TGFS_DEFAULT_PORT),
+        "proxy": (req.proxy or "").strip(),
+        "storage_name": (req.storage_name or "TGFS").strip() or "TGFS",
+        # jwt secret 必须持久化，否则每次重启已签发的 token 全失效
+        "jwt_secret": old.get("jwt_secret") or secrets.token_urlsafe(32),
+        "storage_id": old.get("storage_id") or "",
+    }
+
+    try:
+        write_tgfs_config(t)
+    except Exception as exc:                              # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"写入 TGFS 配置失败：{exc}") from exc
+
+    sid = sync_tgfs_storage(cfg, t)
+    t["storage_id"] = sid
+    cfg["_ui_tgfs"] = t
+
+    # 同步 rclone.conf：把这条 TGFS 也写成一个 remote，预览库和上传都能直接用
+    storages = [{**s, "_plain_pass": t["password"] if s.get("id") == sid else ""}
+                for s in cfg.get("_ui_storages", [])]
+    try:
+        write_rclone_conf(storages)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    stop_lib_servers()
+    dump_config(cfg)
+
+    result = {"ok": True, "storage_id": sid, "config_path": str(TGFS_CONF_PATH),
+              "url": f"http://{TGFS_HOST_ALIAS}:{t['port']}{TGFS_WEBDAV_PATH}"}
+    if not req.restart:
+        result["msg"] = "配置已保存，未重启容器"
+        return result
+    try:
+        _tgfs_docker("restart")
+        result["msg"] = "配置已保存，TGFS 正在重启（首次登录 Telegram 需要 10~40 秒）"
+    except HTTPException as exc:
+        # 容器还没创建过（首次 docker compose up 前）就退化成 start
+        try:
+            _tgfs_docker("start")
+            result["msg"] = "配置已保存，TGFS 已启动（首次登录 Telegram 需要 10~40 秒）"
+        except HTTPException:
+            raise HTTPException(status_code=503,
+                                detail=f"配置已保存，但没能重启 TGFS 容器：{exc.detail}") from exc
+    return result
+
+
+@app.post("/api/tgfs/restart", dependencies=[Depends(verify_auth)])
+def tgfs_restart():
+    if not TGFS_CONF_PATH.exists():
+        raise HTTPException(status_code=400, detail="还没有生成 TGFS 配置，请先在上方保存配置")
+    try:
+        _tgfs_docker("restart")
+    except HTTPException as exc:
+        try:
+            _tgfs_docker("start")
+        except HTTPException:
+            raise exc from None
+    return {"ok": True, "msg": "TGFS 重启中"}
+
+
+@app.post("/api/tgfs/stop", dependencies=[Depends(verify_auth)])
+def tgfs_stop():
+    _tgfs_docker("stop")
+    return {"ok": True, "msg": "TGFS 已停止"}
+
+
+@app.get("/api/tgfs/logs", dependencies=[Depends(verify_auth)])
+def tgfs_logs(tail: int = 120):
+    """取 TGFS 容器最近日志，方便在面板里直接看它连不上 Telegram 之类的错误。"""
+    if not os.path.exists(DOCKER_SOCK):
+        raise HTTPException(status_code=503, detail="面板没有挂载 docker.sock")
+    try:
+        transport = httpx.HTTPTransport(uds=DOCKER_SOCK)
+        with httpx.Client(transport=transport, base_url="http://docker",
+                          timeout=httpx.Timeout(20.0)) as c:
+            r = c.get(f"/containers/{TGFS_CONTAINER}/logs",
+                      params={"stdout": 1, "stderr": 1, "tail": max(10, min(int(tail), 500))})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"Docker API 调用失败：{exc}") from exc
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="TGFS 容器还没创建")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"读取日志失败：HTTP {r.status_code}")
+    # Docker 的日志流是多路复用格式：8 字节头（流类型 + 3 字节填充 + 4 字节长度）+ 正文
+    raw, out, i = r.content, [], 0
+    while i + 8 <= len(raw):
+        size = int.from_bytes(raw[i + 4:i + 8], "big")
+        body = raw[i + 8:i + 8 + size]
+        out.append(body.decode("utf-8", "replace"))
+        i += 8 + size
+    text = "".join(out) if out else raw.decode("utf-8", "replace")
+    return {"ok": True, "logs": text}
+
+
+
 @app.post("/api/test_notify", dependencies=[Depends(verify_auth)])
 def test_notify_api():
     res = send_notification("测试通知", ["✅ **消息通道正常！**", f"网盘状态: `{get_rclone_quota_summary()}`"])

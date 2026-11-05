@@ -484,7 +484,7 @@ body {
         <div class="qb-alert">
           ℹ️ 启动下载时，系统会按「频道 → 存储目标」自动分组，逐组生成独立配置并依次运行下载引擎；
           每组只上传到该组指定的网盘，未指定网盘的频道保留在本地。各组结束后水位线会自动回写，不会重复下载。
-          <br>TGFS 需单独部署 WebDAV 服务并显式勾选上传授权才会参与自动上传，未授权时自动降级为本地存储。
+          <br>TGFS 推荐用下方「TGFS 服务」一键部署（会自动出现在这里并完成授权），也可以手动填写外部已部署的地址。
         </div>
 
         <div v-if="!cfg.storages || cfg.storages.length === 0" class="text-center qb-hint py-8">
@@ -516,7 +516,8 @@ body {
           <!-- TGFS 分支：只读探测 + 显式上传授权 -->
           <div v-if="s.type==='tgfs'" class="qb-alert warn space-y-2">
             <p>
-              ⚠️ TGFS 通过 Rclone 的 <b>webdav</b> 后端接入（Rclone 没有名为 tgfs 的驱动）。请填写<b>已单独部署</b>的 TGFS WebDAV Endpoint 完整地址，
+              ⚠️ TGFS 通过 Rclone 的 <b>webdav</b> 后端接入（Rclone 没有名为 tgfs 的驱动）。
+              下面这条通常是「TGFS 服务」自动生成并托管的；也可以改成<b>外部已部署</b>的 TGFS 地址，
               例如内网 <code>http://tgfs:8080/webdav</code> 或 <code>http://192.168.x.x:PORT/webdav</code>。
               公网地址必须使用 HTTPS；URL 内不得夹带账号、密码、查询串或片段。
             </p>
@@ -538,6 +539,108 @@ body {
             <input type="checkbox" v-model="cfg.delete_after_upload" class="w-4 h-4">
             上传后删除本地文件
           </label>
+        </div>
+      </section>
+
+      <!-- ==================== TGFS 集成：面板内配置并代管 TGFS 容器 ==================== -->
+      <section id="tgfs-card" class="qb-card accent-spring space-y-4">
+        <div class="flex justify-between items-center flex-wrap gap-2 pb-2 border-b border-slate-200">
+          <div class="qb-section-title" style="margin-bottom:0">
+            🗄️ TGFS 服务
+            <span class="qb-hint">（把 Telegram 频道当网盘，对外提供 WebDAV）</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="qb-tag" :class="tgfsTagClass">{{ tgfsTagText }}</span>
+            <button @click="loadTgfs()" class="qb-btn qb-btn-soft qb-btn-sm" :disabled="tgfs.busy">🔄 刷新状态</button>
+          </div>
+        </div>
+
+        <div class="qb-alert">
+          <div class="qb-alert-title">在这里填完就能用，不用再去命令行折腾</div>
+          <div>
+            保存后面板会生成 TGFS 的配置文件、重启 TGFS 容器，并自动把它的 WebDAV
+            挂成一个存储目标（预览库和上传都能直接用）。
+            <br>前提：这个 Bot 必须<b>已在目标频道里并被设为管理员</b>（需要发消息权限），频道建议用私有的。
+          </div>
+        </div>
+
+        <div class="qb-panel">
+          <div class="qb-panel-body" style="margin-top:0">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="qb-field-label">api_id</label>
+                <input v-model.number="tgfs.api_id" class="qb-input" placeholder="从 my.telegram.org 获取">
+              </div>
+              <div>
+                <label class="qb-field-label">api_hash</label>
+                <input v-model="tgfs.api_hash" class="qb-input" placeholder="与 api_id 配套">
+              </div>
+              <div class="md:col-span-2">
+                <label class="qb-field-label">Bot Token</label>
+                <input v-model="tgfs.bot_token" class="qb-input"
+                       :placeholder="tgfs.has_bot_token ? '已配置（留空保持不变）' : '123456789:AAxxxxxxxxxxxxxxxx'">
+              </div>
+              <div>
+                <label class="qb-field-label">存储频道（ID 或 @username）</label>
+                <input v-model="tgfs.channel" class="qb-input" placeholder="-1001234567890">
+              </div>
+              <div>
+                <label class="qb-field-label">WebDAV 用户名</label>
+                <input v-model="tgfs.username" class="qb-input" placeholder="admin">
+              </div>
+              <div>
+                <label class="qb-field-label">WebDAV 密码</label>
+                <input v-model="tgfs.password" type="password" class="qb-input"
+                       :placeholder="tgfs.has_password ? '已配置（留空保持不变）' : '必填，客户端连接时用'">
+              </div>
+              <div>
+                <label class="qb-field-label">服务端口（宿主）</label>
+                <input v-model.number="tgfs.port" class="qb-input" placeholder="1900">
+              </div>
+              <div class="md:col-span-2">
+                <label class="qb-field-label">代理（TGFS 跑在 host 网络，用 127.0.0.1）</label>
+                <input v-model="tgfs.proxy" class="qb-input"
+                       :placeholder="tgfs.suggest_proxy || 'socks5://127.0.0.1:1080（留空则直连）'">
+                <div class="qb-hint" style="margin-top:4px">
+                  境内直连 Telegram 必超时。面板会自动把「系统设置」里的代理翻译成这里能用的地址，
+                  留空即按直连启动。
+                </div>
+              </div>
+              <div>
+                <label class="qb-field-label">存储名称（显示在预览库分类里）</label>
+                <input v-model="tgfs.storage_name" class="qb-input" placeholder="TGFS">
+              </div>
+              <div class="flex items-end">
+                <label class="qb-check">
+                  <input type="checkbox" v-model="tgfs.readonly">
+                  只读账号（客户端不能写入）
+                </label>
+              </div>
+            </div>
+
+            <div v-if="!tgfs.docker_ok" class="qb-alert warn" style="margin-top:12px">
+              <div class="qb-alert-title">面板没有挂载 docker.sock</div>
+              <div>配置可以生成，但面板无法重启 TGFS 容器。请在 docker-compose.yml 里给
+                <code>tg-pro-downloader</code> 挂载 <code>/var/run/docker.sock</code>，重建后即可一键启停。</div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2" style="margin-top:14px">
+              <button @click="saveTgfs()" class="qb-btn qb-btn-primary qb-btn-sm" :disabled="tgfs.busy">
+                {{ tgfs.busy ? '处理中…' : '💾 保存并启动' }}
+              </button>
+              <button @click="restartTgfs()" class="qb-btn qb-btn-info qb-btn-sm" :disabled="tgfs.busy">↻ 重启 TGFS</button>
+              <button @click="stopTgfs()" class="qb-btn qb-btn-danger qb-btn-sm" :disabled="tgfs.busy">■ 停止</button>
+              <button @click="toggleTgfsLogs()" class="qb-btn qb-btn-soft qb-btn-sm">📜 查看日志</button>
+              <span v-if="tgfs.msg" class="qb-tag" :class="tgfs.msgOk ? 'qb-tag-ok' : 'qb-tag-warn'">{{ tgfs.msg }}</span>
+            </div>
+
+            <div class="qb-hint" style="margin-top:10px" v-if="tgfs.conf_exists">
+              WebDAV 地址：<code>{{ tgfs.url }}</code>
+              ｜ 配置文件：<code>{{ tgfs.conf_path }}</code>
+            </div>
+
+            <pre v-if="tgfs.logOpen" class="qb-log" style="margin-top:12px;max-height:280px;overflow:auto">{{ tgfs.logs || '（暂无日志）' }}</pre>
+          </div>
         </div>
       </section>
 
@@ -873,6 +976,15 @@ createApp({
              total: 0, offset: 0, has_more: false, loading: false, err: '' },
       // OTP 换绑状态
       otp: { source: 'env', step: 1, resetOpen: false },
+      // TGFS 集成：面板生成配置 + 代管容器
+      tgfs: {
+        api_id: '', api_hash: '', bot_token: '', channel: '', username: 'admin',
+        password: '', readonly: false, port: 1900, proxy: '', storage_name: 'TGFS',
+        has_bot_token: false, has_password: false, suggest_proxy: '',
+        configured: false, conf_exists: false, conf_path: '', docker_ok: false, url: '',
+        container: {}, webdav: {}, logs: '', logOpen: false,
+        busy: false, msg: '', msgOk: true
+      },
       otpCurrentCode: '', otpNewCode: '', otpNewSecret: '', otpNewUri: '',
       otpResetCode: '', otpBusy: false, otpMsg: '', otpMsgOk: true,
       otpCountdown: 0, otpTimer: null
@@ -890,6 +1002,25 @@ createApp({
     boundChats() {
       const ids = new Set((this.cfg.storages || []).map(s => s.id));
       return (this.cfg.chats || []).filter(c => c.storage_id && ids.has(c.storage_id));
+    },
+    tgfsTagText() {
+      const t = this.tgfs;
+      if (!t.conf_exists && !t.configured) return '未配置';
+      const c = t.container || {};
+      if (!t.docker_ok) return '已配置 · 无法控制容器';
+      if (c.status === 'not-created') return '已配置 · 容器未创建';
+      if (!c.running) return '已停止';
+      const w = t.webdav || {};
+      if (w.ok) return '运行中 · WebDAV 可用';
+      return '运行中 · ' + (w.msg || 'WebDAV 未就绪');
+    },
+    tgfsTagClass() {
+      const t = this.tgfs;
+      const c = t.container || {};
+      if (!t.conf_exists && !t.configured) return 'qb-tag-warn';
+      if (c.running && (t.webdav || {}).ok) return 'qb-tag-ok';
+      if (c.running) return 'qb-tag-info';
+      return 'qb-tag-warn';
     }
   },
   mounted() { this.fetchConfig(); setInterval(() => { if(this.authed && this.tab==='notify') this.fetchLogs(); }, 3000); },
@@ -947,6 +1078,106 @@ createApp({
       this.history.selected = kept.length ? kept : boundChatIds;
       this.fetchSession();
       this.fetchTgStatus();
+      this.loadTgfs();
+    },
+    // ==================== TGFS 集成 ====================
+    async loadTgfs() {
+      try {
+        const r = await fetch('/api/tgfs/status');
+        if (!r.ok) return;
+        const d = await r.json();
+        // 回填时保留用户已经输入但还没保存的内容（密码/Token 不回显，留空表示沿用）
+        this.tgfs = Object.assign({}, this.tgfs, {
+          api_id: this.tgfs.api_id || d.api_id,
+          api_hash: this.tgfs.api_hash || d.api_hash,
+          channel: this.tgfs.channel || d.channel,
+          username: d.username || this.tgfs.username,
+          port: d.port || this.tgfs.port,
+          storage_name: d.storage_name || this.tgfs.storage_name,
+          readonly: !!d.readonly,
+          has_bot_token: !!d.has_bot_token,
+          has_password: !!d.has_password,
+          suggest_proxy: d.suggest_proxy || '',
+          configured: !!d.configured,
+          conf_exists: !!d.conf_exists,
+          conf_path: d.conf_path || '',
+          docker_ok: !!d.docker_ok,
+          url: d.url || '',
+          container: d.container || {},
+          webdav: d.webdav || {},
+          // 代理只在用户没填过时用建议值，避免覆盖手填的
+          proxy: this.tgfs.proxy || d.proxy || d.suggest_proxy || '',
+          bot_token: '', password: ''
+        });
+      } catch (e) { /* 状态读不到不影响其它功能 */ }
+    },
+    async saveTgfs() {
+      if (this.tgfs.busy) return;
+      this.tgfs.busy = true; this.tgfs.msg = '';
+      try {
+        const r = await fetch('/api/tgfs/config', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_id: Number(this.tgfs.api_id) || 0,
+            api_hash: this.tgfs.api_hash || '',
+            bot_token: this.tgfs.bot_token || '',
+            channel: this.tgfs.channel || '',
+            username: this.tgfs.username || 'admin',
+            password: this.tgfs.password || '',
+            readonly: !!this.tgfs.readonly,
+            port: Number(this.tgfs.port) || 1900,
+            proxy: this.tgfs.proxy || '',
+            storage_name: this.tgfs.storage_name || 'TGFS',
+            restart: true
+          })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          this.tgfs.msg = d.msg || '已保存'; this.tgfs.msgOk = true;
+          this.tgfs.bot_token = ''; this.tgfs.password = '';
+          await this.loadTgfs();
+          // TGFS 变成了一个新的存储目标，配置列表要跟着刷新
+          setTimeout(() => { this.fetchConfig(); }, 1500);
+        } else {
+          this.tgfs.msg = d.detail || ('保存失败 HTTP ' + r.status); this.tgfs.msgOk = false;
+        }
+      } catch (e) {
+        this.tgfs.msg = '保存失败：' + e; this.tgfs.msgOk = false;
+      } finally { this.tgfs.busy = false; }
+    },
+    async restartTgfs() {
+      if (this.tgfs.busy) return;
+      this.tgfs.busy = true; this.tgfs.msg = '';
+      try {
+        const r = await fetch('/api/tgfs/restart', { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        this.tgfs.msg = r.ok ? (d.msg || '重启中') : (d.detail || '重启失败');
+        this.tgfs.msgOk = !!r.ok;
+        setTimeout(() => this.loadTgfs(), 3000);
+      } catch (e) { this.tgfs.msg = '重启失败：' + e; this.tgfs.msgOk = false; }
+      finally { this.tgfs.busy = false; }
+    },
+    async stopTgfs() {
+      if (this.tgfs.busy) return;
+      this.tgfs.busy = true; this.tgfs.msg = '';
+      try {
+        const r = await fetch('/api/tgfs/stop', { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        this.tgfs.msg = r.ok ? (d.msg || '已停止') : (d.detail || '停止失败');
+        this.tgfs.msgOk = !!r.ok;
+        setTimeout(() => this.loadTgfs(), 1500);
+      } catch (e) { this.tgfs.msg = '停止失败：' + e; this.tgfs.msgOk = false; }
+      finally { this.tgfs.busy = false; }
+    },
+    async toggleTgfsLogs() {
+      this.tgfs.logOpen = !this.tgfs.logOpen;
+      if (!this.tgfs.logOpen) return;
+      this.tgfs.logs = '正在读取…';
+      try {
+        const r = await fetch('/api/tgfs/logs?tail=150');
+        const d = await r.json().catch(() => ({}));
+        this.tgfs.logs = r.ok ? (d.logs || '（暂无日志）') : (d.detail || '读取失败');
+      } catch (e) { this.tgfs.logs = '读取失败：' + e; }
     },
     // ==================== 代理 ====================
     proxyPayload() {
@@ -1261,7 +1492,7 @@ createApp({
     },
     storageUrlPlaceholder(s) {
       if (s.type === 'webdav') return 'https://host/dav/';
-      if (s.type === 'tgfs') return 'http://tgfs:8080/webdav 或内网 https://host/webdav';
+      if (s.type === 'tgfs') return 'http://host.docker.internal:1900/webdav（面板代管时自动填）';
       return 'SMB主机IP';
     },
     async postConfig() {

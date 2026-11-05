@@ -15,8 +15,38 @@ services:
       - ./downloads:/app/save
       # 设计文档 §6：持久化 rclone.conf，避免重建容器后网盘凭据/remote 丢失
       - ./rclone:/root/.config/rclone
+      # TGFS 集成：面板在这里生成 TGFS 的 config.yaml，TGFS 容器读同一份
+      - ./tgfs_data:/app/tgfs_data
+      # TGFS 集成：面板通过 Docker API 重启 tgfs 容器（代码里只放行白名单容器名）
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      # TGFS 跑在 host 网络、监听宿主 1900，面板从桥接网络要用这个别名访问
+      - "host.docker.internal:host-gateway"
     environment:
       - TZ=Asia/Shanghai
       # 密钥由本地 .env 提供（复制 .env.example 后自行生成强随机值）
       - JWT_SECRET=${JWT_SECRET:?请在 .env 中设置 JWT_SECRET}
       - OTP_SECRET=${OTP_SECRET:?请在 .env 中设置 OTP_SECRET}
+
+  # ==================== TGFS（把 Telegram 当网盘，对外提供 WebDAV） ====================
+  # 由面板「网盘与存储 → TGFS 服务」生成 config.yaml 并控制启停。
+  #
+  # 为什么用 host 网络：Pyrogram 不读 HTTP_PROXY 环境变量，只能在 Client 构造里显式
+  # 指定 SOCKS5；而宿主的代理只监听 127.0.0.1:1080，桥接网络够不到宿主 loopback。
+  # 走 host 网络后容器直接复用宿主代理，也不必再挂一个 socat 中继。
+  tgfs:
+    build:
+      context: ./tgfs_patch
+      args:
+        TGFS_BASE: ${TGFS_IMAGE:-docker.1ms.run/wheatcarrier/tgfs:latest}
+    image: tg-pro-tgfs:local
+    container_name: tgfs
+    # 首次还没有 config.yaml 时会立刻退出，等面板保存配置后再拉起，所以不用 unless-stopped
+    restart: "no"
+    network_mode: host
+    volumes:
+      - ./tgfs_data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - TGFS_DATA_DIR=/data
+      - TGFS_CONFIG_FILE=config.yaml
