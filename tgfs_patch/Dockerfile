@@ -19,4 +19,11 @@ USER root
 COPY sitecustomize.py /usr/local/lib/python3.13/site-packages/sitecustomize.py
 RUN chmod 644 /usr/local/lib/python3.13/site-packages/sitecustomize.py \
     && test -r /usr/local/lib/python3.13/site-packages/sitecustomize.py
+
+# 把「文件描述符」从存储频道挪到独立索引频道（见 fd_tg_msg.py 文件头说明）。
+# 这个是**覆盖源码**，不像 sitecustomize 那样与版本解耦 —— 升级基础镜像时必须重新比对：
+#   fd/tg_msg.py  ae426a9cbd8aaffb16aa4678c14aa439（90 行）
+COPY fd_tg_msg.py /app/tgfs/core/repository/impl/fd/tg_msg.py
+RUN chmod 644 /app/tgfs/core/repository/impl/fd/tg_msg.py \
+    && test -r /app/tgfs/core/repository/impl/fd/tg_msg.py
 USER tgfs
