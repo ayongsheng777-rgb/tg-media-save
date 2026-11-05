@@ -104,7 +104,7 @@ init_env()
 # 安全：不在容器日志中输出 OTP 密钥 / provisioning URI（见设计文档 §2）
 print("\n========== [安全中心] ==========")
 print("动态口令来源：" + ("自定义密钥（设置页换绑，已持久化）" if otp_source() == "custom" else "环境变量 OTP_SECRET"))
-print("可在 WebUI「安全设置」中换绑；日志不回显任何密钥")
+print("可在 WebUI「系统设置」中换绑；日志不回显任何密钥")
 print("================================\n")
 
 # 前端依赖本地化：避免 CDN 不可达导致 Vue 未挂载、页面只剩背景色
@@ -662,7 +662,7 @@ def session_info(claims: dict = Depends(verify_auth)):
         "remain_days": round(remain / 86400, 1),
     }
 
-# ==================== 安全设置：动态口令换绑 ====================
+# ==================== 系统设置：动态口令换绑 ====================
 # 两阶段确认：先用当前口令证明身份 → 生成待确认密钥 → 用新口令确认后才落盘。
 # 确认前旧口令一直有效，pending 只在内存中且 5 分钟过期，避免把自己锁在门外。
 
@@ -738,24 +738,82 @@ def build_pyrogram_client() -> Client:
     cfg = load_config()
     return Client(name=SESSION_NAME, api_id=int(cfg["api_id"]), api_hash=str(cfg["api_hash"]), workdir=str(SESSION_STORE_DIR), proxy=cfg.get("proxy"))
 
+def get_login_state() -> dict:
+    """TG 账号登录态（手机号 / 是否已授权 / 昵称），持久化在 config.yaml 的 _ui_login。
+
+    放在配置里而不是内存里：容器重建、面板重启后登录状态提示不会退化成「未知」。
+    """
+    state = load_config().get("_ui_login") or {}
+    return state if isinstance(state, dict) else {}
+
+def update_login_state(**kwargs) -> dict:
+    """合并写入登录态并原子落盘。"""
+    cfg = load_config()
+    state = dict(cfg.get("_ui_login") or {})
+    state.update(kwargs)
+    cfg["_ui_login"] = state
+    dump_config(cfg)
+    link_engine_config(CONFIG_PATH)
+    return state
+
+_tg_status_cache = {"at": 0.0, "data": None}
+TG_STATUS_TTL = 30  # 秒：连 Telegram DC 不便宜，短时间内不重复探测
+
 @app.get("/api/tg/status", dependencies=[Depends(verify_auth)])
-async def tg_status():
-    if not (SESSION_STORE_DIR / f"{SESSION_NAME}.session").exists():
-        return {"logged_in": False}
+async def tg_status(force: bool = False):
+    """TG 账号登录状态，供前端显示「已登录 / 未登录」提示。
+
+    引擎运行中不再另起连接：Pyrogram 的 session 文件是 SQLite，
+    与引擎同时打开会撞库锁，此时直接按「已登录 + 引擎占用」返回。
+    """
+    now = time.time()
+    if not force and _tg_status_cache["data"] and now - _tg_status_cache["at"] < TG_STATUS_TTL:
+        return _tg_status_cache["data"]
+
+    state = get_login_state()
+    phone = state.get("phone", "")
+    session_exists = (SESSION_STORE_DIR / f"{SESSION_NAME}.session").exists()
+    base = {
+        "logged_in": bool(state.get("authorized")) or session_exists,
+        "authorized": bool(state.get("authorized")),
+        "phone": phone,
+        "engine_busy": False,
+        "user": state.get("user") or None,
+        "login_at": state.get("at", 0),
+    }
+    if not session_exists:
+        base["logged_in"] = False
+        base["authorized"] = False
+        _tg_status_cache.update({"at": now, "data": base})
+        return base
     if engine_thread and engine_thread.is_alive():
-        return {"logged_in": True, "engine_busy": True}
+        base["engine_busy"] = True
+        _tg_status_cache.update({"at": now, "data": base})
+        return base
+
     client = build_pyrogram_client()
     try:
         await client.connect()
         me = await client.get_me()
-        return {"logged_in": True, "user": {"name": f"{me.first_name} {me.last_name or ''}".strip(), "id": me.id}}
+        base["logged_in"] = True
+        base["authorized"] = True
+        base["user"] = {
+            "name": f"{me.first_name} {me.last_name or ''}".strip(),
+            "id": me.id,
+            "username": me.username or "",
+        }
     except Exception:
-        return {"logged_in": False}
+        # 会话文件在但连不上：多半是登录态已失效
+        base["logged_in"] = False
+        base["authorized"] = False
+        base["user"] = None
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
+    _tg_status_cache.update({"at": now, "data": base})
+    return base
 
 class SendCodeReq(BaseModel):
     api_id: int
@@ -780,6 +838,10 @@ async def tg_send_code(req: SendCodeReq):
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     cfg["api_id"], cfg["api_hash"] = req.api_id, api_hash
+    # 手机号随「发送验证码」一并持久化：用户不必再点一次「保存全部配置」
+    login_state = dict(cfg.get("_ui_login") or {})
+    login_state["phone"] = phone
+    cfg["_ui_login"] = login_state
     dump_config(cfg)
     link_engine_config(CONFIG_PATH)
 
@@ -805,7 +867,7 @@ async def tg_send_code(req: SendCodeReq):
         # 且前端只弹「发送失败」，用户完全看不到原因——这里给出可操作的提示。
         if isinstance(e, (ConnectionError, OSError, TimeoutError)):
             detail = ("连不上 Telegram，通常是代理未配置或不可达。"
-                      "请在「🌐 代理设置」中填写代理并先点「测试连接」；"
+                      "请在「⚙️ 系统设置 → 🌐 代理设置」中填写代理并先点「测试连接」；"
                       "容器内 127.0.0.1 指向容器自己，需填宿主机 IP 或 host.docker.internal。"
                       f"（底层错误：{type(e).__name__}）")
         else:
@@ -899,6 +961,14 @@ async def tg_verify_code(req: VerifyCodeReq):
         await client.disconnect()
         pending_auth["client"] = None
         sync_session_files()
+        # 记录登录态：账号昵称与手机号落盘，供「登录状态提示」直接读取
+        update_login_state(
+            authorized=True,
+            phone=pending_auth.get("phone") or get_login_state().get("phone", ""),
+            user={"name": (me.first_name or "").strip(), "id": me.id, "username": me.username or ""},
+            at=time.time(),
+        )
+        _tg_status_cache.update({"at": 0.0, "data": None})
         return {"ok": True, "user": {"name": me.first_name}}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1037,6 +1107,7 @@ class ConfigPayload(BaseModel):
     proxy_port: int = 7890
     proxy_user: str = ""
     proxy_pass: str = ""
+    login_phone: str = ""   # 登录设置里的手机号，持久化保存
     chats: List[dict] = []
     storages: List[dict] = []
     delete_after_upload: bool = False
@@ -1080,6 +1151,8 @@ def get_config():
         "save_path": cfg.get("save_path", "/app/save"),
         "file_path_prefix": cfg.get("file_path_prefix", ["chat_title", "media_datetime"]),
         "media_types": cfg.get("media_types", ["photo", "video"]),
+        # 登录设置：手机号持久化回显
+        "login_phone": get_login_state().get("phone", ""),
         "proxy_enable": bool(proxy), "proxy_scheme": proxy.get("scheme", "socks5"),
         "proxy_host": proxy.get("hostname", "127.0.0.1"), "proxy_port": proxy.get("port", 7890),
         "proxy_user": proxy.get("username", ""),
@@ -1101,6 +1174,11 @@ def save_config(payload: ConfigPayload):
     cfg["api_id"], cfg["api_hash"] = payload.api_id, payload.api_hash.strip()
     cfg["save_path"], cfg["media_types"] = payload.save_path, payload.media_types
     cfg["file_path_prefix"] = ["chat_title", "media_datetime"]
+
+    # --- 登录设置：手机号持久化（与其它 _ui_ 状态同处一个键，避免散落）---
+    login_state = dict(cfg.get("_ui_login") or {})
+    login_state["phone"] = (payload.login_phone or "").strip()
+    cfg["_ui_login"] = login_state
 
     # --- 多网盘（含 TGFS）---
     clean_storages = []

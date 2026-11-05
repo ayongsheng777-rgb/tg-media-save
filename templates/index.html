@@ -106,6 +106,7 @@ body {
 .qb-nav-tab.active { background:linear-gradient(135deg,#6db472,#4a8550) !important; color:#fff !important; box-shadow:0 4px 14px rgba(94,163,99,.3); }
 .qb-alert { border-radius:12px; padding:12px 14px; font-size:12px; line-height:1.75; background:rgba(108,180,214,.12); border:1px solid rgba(108,180,214,.25); color:#2f6d8c; }
 .qb-alert.warn { background:rgba(242,193,78,.14); border-color:rgba(242,193,78,.35); color:#8a6316; }
+.qb-alert.ok { background:rgba(143,201,127,.16); border-color:rgba(143,201,127,.38); color:#2d6a4f; }
 .qb-alert.danger { background:rgba(192,57,43,.10); border-color:rgba(192,57,43,.25); color:#a5342a; }
 .qb-alert-title { font-weight:700; font-size:13px; margin-bottom:3px; }
 .qb-link-row { display:flex; flex-wrap:wrap; gap:10px; margin-top:9px; }
@@ -187,7 +188,7 @@ body {
       </label>
       <button @click="doLogin" class="qb-btn qb-btn-primary qb-login-btn">进入控制台</button>
       <p v-if="errMsg" class="qb-error">{{ errMsg }}</p>
-      <div class="qb-login-foot">忘记口令？需在部署环境重置 OTP_SECRET，或在「安全设置」中换绑</div>
+      <div class="qb-login-foot">忘记口令？需在部署环境重置 OTP_SECRET，或在「系统设置」中换绑</div>
     </div>
   </div>
 
@@ -217,22 +218,38 @@ body {
         <button @click="tab='config'" :class="tab==='config'?'active':''" class="qb-nav-tab">☁️ 网盘与存储</button>
         <button @click="openNotify()" :class="tab==='notify'?'active':''" class="qb-nav-tab">🔔 通知与日志</button>
         <button @click="openPreview()" :class="tab==='preview'?'active':''" class="qb-nav-tab">🎬 预览库</button>
-        <button @click="openSecurity()" :class="tab==='security'?'active':''" class="qb-nav-tab">⚙️ 安全设置</button>
+        <button @click="openSecurity()" :class="tab==='security'?'active':''" class="qb-nav-tab">⚙️ 系统设置</button>
       </nav>
     </header>
 
     <!-- ==================== 登录与频道 ==================== -->
     <div v-if="tab==='tg'" class="space-y-6">
       <section class="qb-card accent-spring">
-        <div class="qb-card-title">👤 TG 账号授权</div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>👤 TG 账号授权</span>
+          <div class="flex items-center gap-2">
+            <span class="qb-tag" :class="tgStatus.checking ? 'qb-tag-info' : (tgStatus.logged_in ? 'qb-tag-ok' : 'qb-tag-warn')">
+              {{ tgStatus.checking ? '检测中' : (tgStatus.logged_in ? 'TG 已登录' : 'TG 未登录') }}
+            </span>
+            <button @click="fetchTgStatus(true)" :disabled="tgStatus.checking" class="qb-btn qb-btn-soft qb-btn-sm">刷新状态</button>
+          </div>
+        </div>
+
+        <!-- 登录状态提示：账号昵称 / 手机号 / 引擎占用情况 -->
+        <div class="qb-alert" :class="tgStatus.checking ? '' : (tgStatus.logged_in ? 'ok' : 'warn')" style="margin-bottom:16px">
+          <div class="qb-alert-title">{{ tgLoginStateTitle() }}</div>
+          <div>{{ tgLoginStateDetail() }}</div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-2">
           <input type="number" v-model.number="cfg.api_id" placeholder="API ID" class="qb-input">
           <input v-model="cfg.api_hash" placeholder="API Hash" class="qb-input">
           <div class="flex space-x-2">
-            <input v-model="loginPhone" placeholder="+86..." class="qb-input">
-            <button @click="sendTgCode" class="qb-btn qb-btn-info">发送验证码</button>
+            <input v-model="cfg.login_phone" placeholder="+86..." class="qb-input">
+            <button @click="sendTgCode" :disabled="tgBusy" class="qb-btn qb-btn-info">{{ codeSent ? '重新发送' : '发送验证码' }}</button>
           </div>
         </div>
+        <div class="qb-hint" style="margin-bottom:14px">手机号会自动保存到服务端，下次打开仍在；点「发送验证码」或「保存全部配置」都会落盘。</div>
         <!-- 新增：Telegram 官方获取 API 的跳转 -->
         <div class="qb-alert">
           <div class="qb-alert-title">🔗 还没有 API ID / API Hash？</div>
@@ -240,64 +257,6 @@ body {
           <div class="qb-link-row">
             <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer" class="qb-link">前往 my.telegram.org 获取 API →</a>
             <a href="https://core.telegram.org/api/obtaining_api_id" target="_blank" rel="noopener noreferrer" class="qb-link qb-link-sub">📖 官方获取指南</a>
-          </div>
-        </div>
-
-        <!-- 代理设置：境内连 Telegram 必须配置；发送验证码时立即应用，无需先保存 -->
-        <div class="qb-panel">
-          <div class="qb-panel-head">
-            <div>
-              <div class="qb-panel-title">
-                🌐 代理设置
-                <span class="qb-tag" :class="cfg.proxy_enable ? 'qb-tag-ok' : 'qb-tag-warn'">
-                  {{ cfg.proxy_enable ? '已启用' : '直连（境内可能不通）' }}
-                </span>
-              </div>
-              <div class="qb-hint" style="margin-top:4px">发送验证码会立即应用这里的代理，不必先点「保存全部配置」。</div>
-            </div>
-            <button @click="proxyOpen = !proxyOpen" class="qb-btn qb-btn-soft qb-btn-sm">{{ proxyOpen ? '收起' : '展开' }}</button>
-          </div>
-          <div v-if="proxyOpen" class="qb-panel-body">
-            <label class="qb-check"><input type="checkbox" v-model="cfg.proxy_enable"> 启用代理</label>
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
-              <div>
-                <label class="qb-field-label">协议</label>
-                <select v-model="cfg.proxy_scheme" class="qb-input" :disabled="!cfg.proxy_enable">
-                  <option value="socks5">socks5</option>
-                  <option value="socks4">socks4</option>
-                  <option value="http">http</option>
-                </select>
-              </div>
-              <div>
-                <label class="qb-field-label">主机</label>
-                <input v-model="cfg.proxy_host" placeholder="宿主机 IP" class="qb-input" :disabled="!cfg.proxy_enable">
-              </div>
-              <div>
-                <label class="qb-field-label">端口</label>
-                <input type="number" v-model.number="cfg.proxy_port" placeholder="7890" class="qb-input" :disabled="!cfg.proxy_enable">
-              </div>
-              <div>
-                <label class="qb-field-label">用户名（可选）</label>
-                <input v-model="cfg.proxy_user" placeholder="无认证则留空" class="qb-input" :disabled="!cfg.proxy_enable">
-              </div>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-3" style="margin-top:12px">
-              <div>
-                <label class="qb-field-label">密码（可选）</label>
-                <input v-model="cfg.proxy_pass" type="password" autocomplete="new-password"
-                       :placeholder="cfg.proxy_has_pass ? '已配置（留空保持不变）' : '无认证则留空'"
-                       class="qb-input" :disabled="!cfg.proxy_enable">
-              </div>
-              <div style="display:flex; align-items:flex-end">
-                <button @click="testProxy" :disabled="proxyBusy || !cfg.proxy_enable" class="qb-btn qb-btn-info">🔌 测试连接</button>
-              </div>
-            </div>
-            <div class="qb-alert warn qb-panel-note">
-              <div class="qb-alert-title">填主机地址前先看这里</div>
-              <div>容器里的 <code>127.0.0.1</code> 指的是容器自己，不是 NAS 宿主机。请填宿主机局域网 IP
-                （与 WebUI 地址同网段的那个 IP）或 <code>host.docker.internal</code>；代理若设了账号密码，用户名与密码都要填。</div>
-            </div>
-            <div v-if="proxyMsg" class="qb-msg" :class="proxyMsgOk ? 'ok' : 'err'">{{ proxyMsg }}</div>
           </div>
         </div>
 
@@ -313,7 +272,6 @@ body {
             <input v-model="tgCode" placeholder="TG 验证码" class="qb-input" style="width:150px">
             <input v-if="need2FA || tg2FA" v-model="tg2FA" type="password" placeholder="两步验证密码" class="qb-input" style="width:170px">
             <button @click="verifyTgCode" :disabled="tgBusy" class="qb-btn qb-btn-primary">确认登录</button>
-            <button @click="sendTgCode" :disabled="tgBusy" class="qb-btn qb-btn-info">重新发送</button>
             <button @click="cancelTgAuth" class="qb-btn qb-btn-soft">取消会话</button>
           </div>
           <div v-if="tgMsg" class="qb-msg" :class="tgMsgOk ? 'ok' : 'err'">{{ tgMsg }}</div>
@@ -525,8 +483,70 @@ body {
       <button @click="saveConfig" class="qb-btn qb-btn-primary w-full" style="padding:13px">💾 保存全部配置</button>
     </div>
 
-    <!-- ==================== 安全设置（新增：OTP 换绑） ==================== -->
+    <!-- ==================== 系统设置（代理 / 设备 / OTP 换绑） ==================== -->
     <div v-if="tab==='security'" class="space-y-6">
+      <!-- 代理设置：境内连 Telegram 必须配置；从「登录与频道」迁到这里统一管理 -->
+      <section class="qb-card accent-mint">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>🌐 代理设置</span>
+          <span class="qb-tag" :class="cfg.proxy_enable ? 'qb-tag-ok' : 'qb-tag-warn'">
+            {{ cfg.proxy_enable ? '已启用' : '直连（境内可能不通）' }}
+          </span>
+        </div>
+        <div class="qb-alert" style="margin-top:12px">
+          <div class="qb-alert-title">代理决定能不能连上 Telegram</div>
+          <div>境内直连 Telegram 基本不通。改完请点下方「保存代理设置」写盘；
+            「发送验证码」时也会立即应用当前填写的值，不必先保存。</div>
+        </div>
+        <div class="qb-panel" style="margin-top:12px">
+          <div class="qb-panel-body" style="margin-top:0">
+            <label class="qb-check"><input type="checkbox" v-model="cfg.proxy_enable"> 启用代理</label>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div>
+                <label class="qb-field-label">协议</label>
+                <select v-model="cfg.proxy_scheme" class="qb-input" :disabled="!cfg.proxy_enable">
+                  <option value="socks5">socks5</option>
+                  <option value="socks4">socks4</option>
+                  <option value="http">http</option>
+                </select>
+              </div>
+              <div>
+                <label class="qb-field-label">主机</label>
+                <input v-model="cfg.proxy_host" placeholder="宿主机 IP" class="qb-input" :disabled="!cfg.proxy_enable">
+              </div>
+              <div>
+                <label class="qb-field-label">端口</label>
+                <input type="number" v-model.number="cfg.proxy_port" placeholder="7890" class="qb-input" :disabled="!cfg.proxy_enable">
+              </div>
+              <div>
+                <label class="qb-field-label">用户名（可选）</label>
+                <input v-model="cfg.proxy_user" placeholder="无认证则留空" class="qb-input" :disabled="!cfg.proxy_enable">
+              </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3" style="margin-top:12px">
+              <div>
+                <label class="qb-field-label">密码（可选）</label>
+                <input v-model="cfg.proxy_pass" type="password" autocomplete="new-password"
+                       :placeholder="cfg.proxy_has_pass ? '已配置（留空保持不变）' : '无认证则留空'"
+                       class="qb-input" :disabled="!cfg.proxy_enable">
+              </div>
+              <div style="display:flex; align-items:flex-end">
+                <button @click="testProxy" :disabled="proxyBusy || !cfg.proxy_enable" class="qb-btn qb-btn-info">🔌 测试连接</button>
+              </div>
+              <div style="display:flex; align-items:flex-end">
+                <button @click="saveProxy" :disabled="proxyBusy" class="qb-btn qb-btn-primary">💾 保存代理设置</button>
+              </div>
+            </div>
+            <div class="qb-alert warn qb-panel-note">
+              <div class="qb-alert-title">填主机地址前先看这里</div>
+              <div>容器里的 <code>127.0.0.1</code> 指的是容器自己，不是 NAS 宿主机。请填宿主机局域网 IP
+                （与 WebUI 地址同网段的那个 IP）或 <code>host.docker.internal</code>；代理若设了账号密码，用户名与密码都要填。</div>
+            </div>
+            <div v-if="proxyMsg" class="qb-msg" :class="proxyMsgOk ? 'ok' : 'err'">{{ proxyMsg }}</div>
+          </div>
+        </div>
+      </section>
+
       <section class="qb-card accent-spring">
         <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
           <span>🖥️ 当前设备</span>
@@ -675,10 +695,12 @@ createApp({
       cfg: {
         file_path_prefix: ['chat_title', 'media_datetime'], media_types: ['photo', 'video'], chats: [], storages: [],
         proxy_enable: false, proxy_scheme: 'socks5', proxy_host: '127.0.0.1', proxy_port: 7890,
-        proxy_user: '', proxy_pass: '', proxy_has_pass: false
+        proxy_user: '', proxy_pass: '', proxy_has_pass: false,
+        login_phone: ''
       },
-      tgStatus: { logged_in: false }, loginPhone: '', codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
-      proxyOpen: true, proxyBusy: false, proxyMsg: '', proxyMsgOk: true,
+      tgStatus: { logged_in: false, authorized: false, phone: '', engine_busy: false, user: null, login_at: 0, checking: false },
+      codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
+      proxyBusy: false, proxyMsg: '', proxyMsgOk: true,
       tgBusy: false, tgMsg: '', tgMsgOk: true,
       scanOpen: false, collectBusy: false, collectMsg: '', collectMsgOk: true,
       collect: { selected: [], storage_id: '', storage_path: '', start_id: 0, start_engine: false },
@@ -741,11 +763,13 @@ createApp({
       this.cfgErr = '';
       const defaults = {
         chats: [], storages: [], proxy_enable: false, proxy_scheme: 'socks5',
-        proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false
+        proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false,
+        login_phone: ''
       };
       this.cfg = Object.assign({}, defaults, d);
       this.authed = true;
       this.fetchSession();
+      this.fetchTgStatus();
     },
     // ==================== 代理 ====================
     proxyPayload() {
@@ -759,6 +783,11 @@ createApp({
       };
     },
     setProxyMsg(text, ok) { this.proxyMsg = text; this.proxyMsgOk = !!ok; },
+    cfgProxySummary() {
+      if (!this.cfg.proxy_enable) return '代理已关闭（将直连 Telegram，境内通常连不上）';
+      const auth = this.cfg.proxy_user ? '，含账号认证' : '';
+      return '代理已保存：' + this.cfg.proxy_scheme + '://' + this.cfg.proxy_host + ':' + this.cfg.proxy_port + auth;
+    },
     setTgMsg(text, ok) { this.tgMsg = text; this.tgMsgOk = !!ok; },
     async testProxy() {
       this.proxyBusy = true; this.proxyMsg = '';
@@ -775,16 +804,51 @@ createApp({
       this.proxyBusy = false;
     },
     // ==================== TG 登录 ====================
+    async fetchTgStatus(force) {
+      // 探测需要连一次 Telegram DC（冷启约 2s），期间用 checking 态避免误显示「未登录」
+      this.tgStatus = Object.assign({}, this.tgStatus, { checking: true });
+      const base = { logged_in: false, authorized: false, phone: '', engine_busy: false, user: null, login_at: 0, checking: false };
+      try {
+        const r = await fetch('/api/tg/status' + (force ? '?force=true' : ''));
+        const d = r.ok ? await r.json().catch(() => null) : null;
+        this.tgStatus = Object.assign({}, base, d || {}, { checking: false });
+      } catch (e) {
+        this.tgStatus = Object.assign({}, this.tgStatus, { checking: false });
+      }
+    },
+    tgLoginStateTitle() {
+      const s = this.tgStatus || {};
+      if (s.checking) return '正在检测 Telegram 登录状态…';
+      if (!s.logged_in) return 'Telegram 账号尚未登录';
+      const name = s.user && s.user.name ? s.user.name : '已登录账号';
+      return 'Telegram 已登录：' + name;
+    },
+    tgLoginStateDetail() {
+      const s = this.tgStatus || {};
+      if (s.checking) return '正在连接 Telegram 校验会话有效性，通常 1–2 秒。';
+      const parts = [];
+      if (s.phone) parts.push('登录手机号：' + s.phone);
+      if (s.user && s.user.username) parts.push('账号：@' + s.user.username);
+      if (s.login_at) parts.push('登录时间：' + new Date(s.login_at * 1000).toLocaleString('zh-CN', { hour12: false }));
+      if (s.engine_busy) parts.push('引擎运行中，显示的是最近一次登录结果');
+      if (!parts.length) {
+        return s.logged_in
+          ? '会话文件存在但暂未取到账号详情，刷新页面可再次探测。'
+          : '请在上方填写手机号 → 点「发送验证码」→ 填入收到的验证码 → 点「确认登录」。';
+      }
+      return parts.join('；');
+    },
     async sendTgCode() {
+      const phone = (this.cfg.login_phone || '').trim();
       if (!this.cfg.api_id || !this.cfg.api_hash) { this.setTgMsg('请先填写 API ID 和 API Hash（可用上方官方链接获取）', false); return; }
-      if (!this.loginPhone.trim()) { this.setTgMsg('请填写 Telegram 手机号，需含国家代码', false); return; }
+      if (!phone) { this.setTgMsg('请填写 Telegram 手机号，需含国家代码', false); return; }
       this.tgBusy = true; this.tgMsg = '';
       try {
         const res = await fetch('/api/tg/send_code', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             api_id: Number(this.cfg.api_id), api_hash: this.cfg.api_hash,
-            phone: this.loginPhone, proxy: this.proxyPayload()
+            phone: phone, proxy: this.proxyPayload()
           })
         });
         const d = await res.json().catch(() => ({}));
@@ -808,6 +872,7 @@ createApp({
           this.codeSent = false; this.need2FA = false;
           this.setTgMsg('登录成功，正在刷新频道列表…', true);
           this.fetchDialogs();
+          this.fetchTgStatus(true);
         } else this.setTgMsg(d.detail || d.msg || '验证失败', false);
       } catch (e) {
         this.setTgMsg('请求失败：' + e, false);
@@ -896,7 +961,7 @@ createApp({
       if (s.type === 'tgfs') return 'http://tgfs:8080/webdav 或内网 https://host/webdav';
       return 'SMB主机IP';
     },
-    async saveConfig() {
+    async postConfig() {
       const payload = JSON.parse(JSON.stringify(this.cfg));
       // 数字框清空时 v-model.number 会给出 ''，后端 int 字段会 422，先归一化
       payload.proxy_port = Number(payload.proxy_port) || 7890;
@@ -905,16 +970,39 @@ createApp({
       if (payload.storages) {
         payload.storages.forEach(s => { delete s.has_pass; delete s._showPass; });
       }
-      let res;
+      const res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+      return { res, data: await res.json().catch(() => ({})) };
+    },
+    async saveConfig() {
+      let out;
       try {
-        res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        out = await this.postConfig();
       } catch (e) {
         alert('保存失败：无法连接服务 (' + e + ')');
         return;
       }
-      const data = await res.json().catch(() => ({}));
+      const { res, data } = out;
       if (res.ok && data.status === 'saved') { alert('配置已保存！共 ' + data.storages_count + ' 个存储目标'); this.fetchConfig(); }
       else alert('保存失败：' + (data.detail || '未知错误'));
+    },
+    async saveProxy() {
+      this.proxyBusy = true;
+      let out;
+      try {
+        out = await this.postConfig();
+      } catch (e) {
+        this.setProxyMsg('保存失败：无法连接服务 (' + e + ')', false);
+        this.proxyBusy = false;
+        return;
+      }
+      const { res, data } = out;
+      if (res.ok && data.status === 'saved') {
+        this.setProxyMsg(cfgProxySummary(), true);
+        this.fetchConfig();
+      } else {
+        this.setProxyMsg('保存失败：' + (data.detail || '未知错误'), false);
+      }
+      this.proxyBusy = false;
     },
     async testStorage(sid) {
       if (!sid) { alert('这是新增的网盘，请先点「保存全部配置」后再测试连接'); return; }
@@ -941,7 +1029,7 @@ createApp({
     async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
     async loadMedia() { const r = await fetch('/api/media'); if(r.ok) this.mediaList = await r.json(); },
 
-    // ==================== 安全设置：OTP 换绑 ====================
+    // ==================== 系统设置：OTP 换绑 ====================
     async apiPost(path, body) {
       const r = await fetch(path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: body === undefined ? undefined : JSON.stringify(body) });
       return { ok: r.ok, d: await r.json().catch(() => ({})) };
