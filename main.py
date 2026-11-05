@@ -1,4 +1,4 @@
-import os, re, io, json, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
+import os, re, io, json, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy, tempfile
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
@@ -1638,6 +1638,7 @@ def test_tgfs_endpoint(req: Optional[TestTGFSReq] = None):
 
 TGFS_LOCAL_DIR = Path("/app/tgfs_data")          # 与 tgfs 容器的 /data 是同一个卷
 TGFS_CONF_PATH = TGFS_LOCAL_DIR / "config.yaml"
+TGFS_ACCOUNT_SESSION = TGFS_LOCAL_DIR / "account.session"   # 存 session_string 的纯文本
 TGFS_CONTAINER = "tgfs"                          # 唯一允许操作的容器
 TGFS_DEFAULT_PORT = 1900
 TGFS_WEBDAV_PATH = "/webdav"
@@ -1733,9 +1734,85 @@ def _suggest_tgfs_proxy() -> str:
     return f"{scheme}://{auth}{host}:{conf.get('port') or 1080}"
 
 
+def normalize_tgfs_channel(raw) -> str:
+    """把用户填的频道标识归一成 TGFS 要的形状。
+
+    TGFS 的 resolve_channel_id 是这么写的：
+        try:
+            return int(f"-100{channel_id}")
+        except ValueError:
+            resolve_peer(f"@{channel_id}")
+
+    也就是说 `private_file_channel` 要的是频道 ID 的**纯数字部分**：
+      "3807758162"      -> int("-1003807758162") = -1003807758162   ✓
+      "-1003807758162"  -> int("-100-1003807758162") 抛 ValueError
+                        -> 退化去 resolve_peer("@-1003807758162") -> PeerIdInvalid ✗
+
+    面板的输入框写的是「ID 或 @username」，用户几乎必然填完整 ID，
+    所以这里必须把 `-100` 前缀剥掉；填 username 的去掉 @ 走另一条分支。
+    """
+    s = str(raw or "").strip()
+    if s.startswith("-100"):
+        s = s[4:]
+    elif s.startswith("@"):
+        s = s[1:]
+    return s
+
+
+def export_tgfs_account_session() -> str:
+    """把面板已登录的用户账号导出成 session_string，供 TGFS 读置顶消息。
+
+    为什么必须要这一步：TGFS 的 `metadata.type = pinned_message` 是拿频道的
+    **置顶消息**存文件索引的，而 Bot API 读不了置顶消息 ——
+    `tgfs/core/api/message/__init__.py` 里只要 `tdlib_api.account is None`
+    就直接抛 PinnedMessageNotSupported。所以必须配 `telegram.account`。
+
+    而 `telegram.account.session_file` 要的东西和直觉不一样：它不是 Pyrogram 的
+    `.session` SQLite 文件，而是 `Session.get()` 直接 `read().strip()` 的
+    **纯文本 session_string**。所以这里导出的是一行字符串。
+
+    导出时复制一份 session 副本再连：直接开原文件会和正在跑的引擎抢 SQLite 锁。
+    """
+    src = SESSION_STORE_DIR / f"{SESSION_NAME}.session"
+    if not src.exists():
+        raise RuntimeError("面板还没有登录 Telegram 账号，TGFS 无法读写频道置顶消息")
+
+    cfg = load_config()
+    api_id = int(cfg.get("api_id") or 0)
+    api_hash = str(cfg.get("api_hash") or "")
+    if not api_id or not api_hash:
+        raise RuntimeError("缺少 api_id / api_hash，请先在「登录与频道」里配好")
+    proxy = cfg.get("proxy") or None
+
+    tmpdir = tempfile.mkdtemp(prefix="tgfs_sess_")
+    try:
+        shutil.copy2(src, os.path.join(tmpdir, f"{SESSION_NAME}.session"))
+
+        async def _export() -> str:
+            c = Client(name=SESSION_NAME, api_id=api_id, api_hash=api_hash,
+                       workdir=tmpdir, proxy=proxy)
+            await c.start()
+            try:
+                return await c.export_session_string()
+            finally:
+                await c.stop()
+
+        sess = asyncio.run(_export())
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if not sess:
+        raise RuntimeError("导出 session_string 为空，请重新登录 Telegram 账号")
+    TGFS_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    TGFS_ACCOUNT_SESSION.write_text(sess, encoding="utf-8")
+    # tgfs 容器里是非 root 用户，600 会 Permission denied
+    os.chmod(TGFS_ACCOUNT_SESSION, 0o644)
+    return sess
+
+
 def build_tgfs_config(t: dict) -> dict:
     """把面板里的字段翻译成 TGFS 的 config.yaml 结构。"""
-    channel = str(t.get("channel") or "").strip()
+    channel = normalize_tgfs_channel(t.get("channel"))
     cfg = {
         "telegram": {
             "api_id": int(t.get("api_id") or 0),
@@ -1746,6 +1823,14 @@ def build_tgfs_config(t: dict) -> dict:
             },
             "private_file_channel": [channel],
             "lib": "pyrogram",
+            # pinned_message 模式必须有用户账号（bot 读不了置顶消息）。
+            # session_file 用相对路径，TGFS 的 expand_path 会拼成 /data/account.session；
+            # 两个 used_to_* 都关掉 —— 上传下载仍走 bot，账号只用来读索引。
+            "account": {
+                "session_file": "account.session",
+                "used_to_upload": False,
+                "used_to_download": False,
+            },
         },
         "tgfs": {
             "users": {
@@ -1897,12 +1982,23 @@ def tgfs_save_config(req: TGFSConfigReq):
         "username": username,
         "readonly": bool(req.readonly),
         "port": int(req.port or TGFS_DEFAULT_PORT),
-        "proxy": (req.proxy or "").strip(),
+        # 空值沿用已保存的代理，和 bot_token / password 同样的语义。
+        # 之前是直接取 req.proxy，前端一旦没预填就会把代理清空 ——
+        # TGFS 在境内没有代理根本连不上 Telegram，表现是满屏 Connection timed out。
+        "proxy": (req.proxy or "").strip() or (old.get("proxy") or ""),
         "storage_name": (req.storage_name or "TGFS").strip() or "TGFS",
         # jwt secret 必须持久化，否则每次重启已签发的 token 全失效
         "jwt_secret": old.get("jwt_secret") or secrets.token_urlsafe(32),
         "storage_id": old.get("storage_id") or "",
     }
+
+    # 先导出账号会话：TGFS 的 pinned_message 模式缺了它起不来（bot 读不了置顶消息）。
+    # 放在写配置之前，失败就直接报错，避免留下「配置写了但容器起不来」的中间态。
+    try:
+        export_tgfs_account_session()
+    except Exception as exc:                              # noqa: BLE001
+        raise HTTPException(status_code=422,
+                            detail=f"导出 Telegram 账号会话失败：{exc}") from exc
 
     try:
         write_tgfs_config(t)
