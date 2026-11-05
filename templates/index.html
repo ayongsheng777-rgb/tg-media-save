@@ -165,6 +165,33 @@ body {
 ::-webkit-scrollbar-track { background:transparent; }
 ::-webkit-scrollbar-thumb { background:rgba(107,122,136,.3); border-radius:999px; }
 ::-webkit-scrollbar-thumb:hover { background:rgba(94,163,99,.55); }
+/* ===== 预览库：存储方案分类 ===== */
+.qb-src-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; margin-top:14px; }
+.qb-src {
+  display:flex; flex-direction:column; gap:6px; text-align:left; cursor:pointer;
+  padding:13px 14px; border-radius:14px; font:inherit;
+  background:rgba(255,255,255,.5); border:1.5px solid rgba(255,255,255,.9);
+  transition:transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+.qb-src:hover { transform:translateY(-2px); box-shadow:0 8px 20px rgba(90,120,110,.14); }
+.qb-src.on { border-color:rgba(94,163,99,.75); background:rgba(143,201,127,.2); box-shadow:0 8px 22px rgba(94,163,99,.18); }
+.qb-src .nm { font-weight:700; font-size:14px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.qb-src .meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.qb-src .path { font-size:11.5px; color:var(--ink-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+.qb-lib-toolbar { display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin-top:14px; }
+.qb-chip {
+  cursor:pointer; font:inherit; font-size:12.5px; padding:5px 12px; border-radius:999px;
+  background:rgba(255,255,255,.55); border:1.5px solid rgba(255,255,255,.95); color:var(--ink-soft);
+}
+.qb-chip.on { background:rgba(108,180,214,.26); border-color:rgba(108,180,214,.6); color:#2f6d8c; font-weight:700; }
+.qb-lib-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; margin-top:14px; }
+.qb-lib-item { background:rgba(255,255,255,.6); border:1.5px solid rgba(255,255,255,.95); border-radius:14px; overflow:hidden; }
+.qb-lib-item .thumb { height:132px; background:#10161a; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.qb-lib-item .thumb img, .qb-lib-item .thumb video { width:100%; height:100%; object-fit:cover; display:block; }
+.qb-lib-item .cap { padding:7px 9px; font-size:11.5px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.qb-lib-item .sub { padding:0 9px 8px; font-size:10.5px; color:var(--ink-soft); display:flex; justify-content:space-between; gap:6px; }
+@media (max-width:560px) { .qb-lib-grid { grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:9px; } .qb-lib-item .thumb { height:104px; } }
 @media (max-width:768px) {
   .qb-card { padding:16px !important; }
   .qb-nav-tab { padding:7px 10px; font-size:12px; }
@@ -459,12 +486,12 @@ body {
         </div>
 
         <div v-if="!cfg.storages || cfg.storages.length === 0" class="text-center qb-hint py-8">
-          暂未配置网盘。点击「添加网盘」开始配置 InfiniCLOUD / WebDAV / SMB / TGFS 存储目标。
+          暂未配置网盘。点击「添加网盘」开始配置 WebDAV / SMB / TGFS 存储目标。
         </div>
 
         <div v-for="(s, idx) in cfg.storages" :key="idx" class="qb-subcard space-y-3">
           <div class="flex justify-between items-center flex-wrap gap-2">
-            <input v-model="s.name" placeholder="网盘名称（如：我的InfiniCLOUD）" class="qb-input" style="flex:1;min-width:220px;border:none !important;background:transparent !important;font-weight:600;color:#2f6d8c !important">
+            <input v-model="s.name" placeholder="网盘名称（如：网盘账号1、webdav1）" class="qb-input" style="flex:1;min-width:220px;border:none !important;background:transparent !important;font-weight:600;color:#2f6d8c !important">
             <div class="flex gap-2">
               <button @click="testStorage(s.id)" class="qb-btn qb-btn-info qb-btn-sm">⚡ 测试</button>
               <button @click="cfg.storages.splice(idx,1)" class="qb-btn qb-btn-danger qb-btn-sm">删除</button>
@@ -472,7 +499,6 @@ body {
           </div>
           <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
             <select v-model="s.type" class="qb-input">
-              <option value="infinicloud">InfiniCLOUD</option>
               <option value="webdav">WebDAV</option>
               <option value="smb">SMB</option>
               <option value="tgfs">TGFS（独立 WebDAV 网关）</option>
@@ -717,16 +743,86 @@ body {
     </div>
 
     <!-- ==================== 预览库 ==================== -->
-    <div v-if="tab==='preview'">
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div v-for="item in mediaList" :key="item.rel_path" class="qb-card" style="padding:0">
-          <div class="h-48 bg-black flex items-center justify-center" style="border-radius:18px 18px 0 0;overflow:hidden">
-            <img v-if="item.type==='image'" :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" class="object-cover w-full h-full">
-            <video v-else :src="'/api/stream?path='+encodeURIComponent(item.rel_path)" controls class="w-full h-full"></video>
-          </div>
-          <div class="p-3 text-xs truncate">{{ item.name }}</div>
+    <div v-if="tab==='preview'" class="space-y-4">
+
+      <!-- 存储方案分类 -->
+      <section class="qb-card">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>🎬 预览库</span>
+          <span class="qb-tag qb-tag-info">直接读网盘 · 不读容器本地</span>
         </div>
-      </div>
+        <div class="qb-alert" style="margin-top:10px">
+          <div class="qb-alert-title">按存储方案分类</div>
+          <div>每个网盘（网盘账号1 / 网盘账号2 / webdav1 / tgfs …）单独一类，点开即列出该网盘
+            <code>远程目录</code> 下已上传的媒体。上传后本地文件会被删掉，所以这里读的是网盘上的数据。</div>
+        </div>
+
+        <div v-if="libSourcesLoading" class="qb-hint" style="margin-top:14px">正在读取存储方案…</div>
+        <div v-else-if="!libSources.length" class="qb-alert warn" style="margin-top:14px">
+          还没有配置网盘。请先到「存储设置」添加 WebDAV / SMB / TGFS，并让频道绑定到它。
+        </div>
+        <div v-else class="qb-src-grid">
+          <button v-for="s in libSources" :key="s.id"
+                  @click="selectLibSource(s.id)"
+                  :class="['qb-src', lib.sid===s.id ? 'on' : '']">
+            <span class="nm">{{ s.name }}</span>
+            <span class="meta">
+              <span class="qb-tag qb-tag-info">{{ storageTypeLabel(s.type) }}</span>
+              <span class="qb-tag" :class="s.has_pass ? 'qb-tag-ok' : 'qb-tag-warn'">{{ s.has_pass ? '凭据已配置' : '缺少密码' }}</span>
+            </span>
+            <span class="path">📁 {{ s.remote_dir }}</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 该存储下的文件 -->
+      <section v-if="lib.sid" class="qb-card">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>🗂 {{ lib.name || lib.sid }}</span>
+          <span class="qb-tag qb-tag-ok">{{ lib.loading ? '读取中…' : lib.total + ' 个文件' }}</span>
+        </div>
+
+        <div class="qb-lib-toolbar">
+          <button v-for="k in libKinds" :key="k.v"
+                  @click="setLibKind(k.v)"
+                  :class="['qb-chip', lib.kind===k.v ? 'on' : '']">{{ k.t }}</button>
+          <input v-model="lib.q" @keyup.enter="reloadLib()" placeholder="搜索文件名 / 目录，回车" class="qb-input" style="flex:1;min-width:180px">
+          <button @click="reloadLib()" :disabled="lib.loading" class="qb-btn qb-btn-soft qb-btn-sm">🔄 刷新</button>
+        </div>
+
+        <div v-if="lib.dirs.length > 1" class="qb-lib-toolbar">
+          <button @click="setLibDir('')" :class="['qb-chip', lib.dir==='' ? 'on' : '']">全部路径</button>
+          <button v-for="d in lib.dirs" :key="d.name"
+                  @click="setLibDir(d.name)"
+                  :class="['qb-chip', lib.dir===d.name ? 'on' : '']">{{ d.name }} · {{ d.count }}</button>
+        </div>
+
+        <div v-if="lib.err" class="qb-alert warn" style="margin-top:12px">{{ lib.err }}</div>
+
+        <div v-else-if="!lib.loading && !lib.items.length" class="qb-hint" style="margin-top:16px">
+          这个网盘目录下还没有媒体文件。可能是频道还没采集完，或远程目录填错了。
+        </div>
+
+        <div class="qb-lib-grid">
+          <div v-for="item in lib.items" :key="item.path" class="qb-lib-item">
+            <div class="thumb">
+              <img v-if="item.type==='image'" :src="libRawUrl(item)" :alt="item.name" loading="lazy">
+              <video v-else :src="libRawUrl(item)" controls preload="metadata"></video>
+            </div>
+            <div class="cap" :title="item.path">{{ item.name }}</div>
+            <div class="sub">
+              <span>{{ item.size_mb }} MB</span>
+              <span>{{ item.mtime.slice(5, 16) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="lib.has_more" class="text-center" style="margin-top:16px">
+          <button @click="loadMoreLib()" :disabled="lib.loading" class="qb-btn qb-btn-primary">
+            {{ lib.loading ? '加载中…' : '加载更多（已显示 ' + lib.items.length + ' / ' + lib.total + '）' }}
+          </button>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -752,7 +848,12 @@ createApp({
       collect: { selected: [], storage_id: '', storage_path: '', start_id: 0 },
       historyBusy: false, historyMsg: '', historyMsgOk: true,
       history: { selected: [], reset_watermark: true, start_engine: true },
-      dialogs: [], dialogSearch: '', logs: [], mediaList: [],
+      dialogs: [], dialogSearch: '', logs: [],
+      // 预览库：按存储方案分类，数据全部来自网盘（rclone），不读容器本地
+      libSources: [], libSourcesLoading: false,
+      libKinds: [{ v: '', t: '全部' }, { v: 'image', t: '🖼 图片' }, { v: 'video', t: '🎬 视频' }],
+      lib: { sid: '', name: '', q: '', kind: '', dir: '', items: [], dirs: [],
+             total: 0, offset: 0, has_more: false, loading: false, err: '' },
       // OTP 换绑状态
       otp: { source: 'env', step: 1, resetOpen: false },
       otpCurrentCode: '', otpNewCode: '', otpNewSecret: '', otpNewUri: '',
@@ -1053,17 +1154,89 @@ createApp({
       this.cfg.chats.push({ chat_id: d.chat_id, title: d.title, last_read_message_id: 0, storage_id: '', storage_path: '' });
     },
     async openNotify() { this.tab = 'notify'; await this.fetchLogs(); },
-    async openPreview() { await this.loadMedia(); this.tab = 'preview'; },
+    async openPreview() {
+      this.tab = 'preview';
+      await this.loadLibSources();
+      if (!this.lib.sid && this.libSources.length) {
+        await this.selectLibSource(this.libSources[0].id);
+      } else if (this.lib.sid) {
+        await this.fetchLib(true);
+      }
+    },
+    storageTypeLabel(t) {
+      if (t === 'tgfs') return 'TGFS';
+      if (t === 'smb') return 'SMB';
+      return 'WebDAV';
+    },
+    async loadLibSources() {
+      this.libSourcesLoading = true;
+      try {
+        const r = await fetch('/api/library/sources');
+        if (r.ok) {
+          const d = await r.json();
+          this.libSources = d.sources || [];
+        } else {
+          this.libSources = [];
+        }
+      } catch (e) {
+        this.libSources = [];
+      } finally {
+        this.libSourcesLoading = false;
+      }
+    },
+    async selectLibSource(sid) {
+      const s = this.libSources.find(x => x.id === sid);
+      this.lib = { sid, name: s ? s.name : sid, q: '', kind: '', dir: '',
+                   items: [], dirs: [], total: 0, offset: 0, has_more: false, loading: false, err: '' };
+      await this.fetchLib(true);
+    },
+    setLibKind(v) { this.lib.kind = v; this.fetchLib(true); },
+    setLibDir(v) { this.lib.dir = v; this.fetchLib(true); },
+    reloadLib() { this.fetchLib(true, true); },
+    loadMoreLib() { this.fetchLib(false); },
+    libRawUrl(item) {
+      return '/api/library/raw?sid=' + encodeURIComponent(this.lib.sid)
+           + '&path=' + encodeURIComponent(item.path);
+    },
+    async fetchLib(reset, refresh) {
+      if (!this.lib.sid) return;
+      if (reset) { this.lib.items = []; this.lib.offset = 0; this.lib.has_more = false; }
+      this.lib.loading = true;
+      this.lib.err = '';
+      const params = new URLSearchParams({
+        sid: this.lib.sid, q: this.lib.q || '', kind: this.lib.kind || '',
+        dir: this.lib.dir || '', limit: '120', offset: String(reset ? 0 : this.lib.offset),
+      });
+      if (refresh) params.set('refresh', 'true');
+      try {
+        const r = await fetch('/api/library?' + params.toString());
+        const d = await r.json().catch(() => null);
+        if (!r.ok) {
+          this.lib.err = (d && d.detail) ? d.detail : ('读取失败：HTTP ' + r.status);
+          return;
+        }
+        this.lib.name = d.name || this.lib.sid;
+        this.lib.total = d.total || 0;
+        this.lib.dirs = d.dirs || [];
+        this.lib.has_more = !!d.has_more;
+        this.lib.offset = (d.offset || 0) + (d.items || []).length;
+        this.lib.items = reset ? (d.items || []) : this.lib.items.concat(d.items || []);
+      } catch (e) {
+        this.lib.err = '读取失败：' + e;
+      } finally {
+        this.lib.loading = false;
+      }
+    },
     storageName(sid) {
       const s = (this.cfg.storages || []).find(x => x.id === sid);
       return s ? s.name : sid;
     },
     addStorage() {
       if (!this.cfg.storages) this.cfg.storages = [];
-      this.cfg.storages.push({ id: '', name: '', type: 'infinicloud', url: '', user: '', pass: '', remote_dir: 'tg_backup', has_pass: false, upload_authorized: false });
+      const n = (this.cfg.storages || []).length + 1;
+      this.cfg.storages.push({ id: '', name: '网盘账号' + n, type: 'webdav', url: '', user: '', pass: '', remote_dir: 'tg_backup', has_pass: false, upload_authorized: false });
     },
     storageUrlPlaceholder(s) {
-      if (s.type === 'infinicloud') return '节点名(如 aki)';
       if (s.type === 'webdav') return 'https://host/dav/';
       if (s.type === 'tgfs') return 'http://tgfs:8080/webdav 或内网 https://host/webdav';
       return 'SMB主机IP';
@@ -1134,7 +1307,6 @@ createApp({
     async testNotify() { const r = await fetch('/api/test_notify', { method: 'POST' }); alert((await r.json()).msg); },
     async fetchLogs() { const r = await fetch('/api/logs'); if(r.ok) { const d = await r.json(); this.logs = d.logs; this.cfg.running = d.running; } },
     async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
-    async loadMedia() { const r = await fetch('/api/media'); if(r.ok) this.mediaList = await r.json(); },
 
     // ==================== 系统设置：OTP 换绑 ====================
     async apiPost(path, body) {

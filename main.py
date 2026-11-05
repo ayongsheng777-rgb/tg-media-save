@@ -1,4 +1,4 @@
-import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
+import os, re, json, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
@@ -6,7 +6,7 @@ from urllib.parse import urlsplit, quote
 import pyotp, jwt, httpx
 from ruamel.yaml import YAML
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pyrogram import Client
@@ -36,7 +36,19 @@ OTP_PENDING_TTL = 300  # 换绑会话 5 分钟有效
 _otp_lock = threading.Lock()
 _otp_pending = {"secret": "", "created_at": 0.0}
 
-ALLOWED_STORAGE_TYPES = {"infinicloud", "webdav", "smb", "tgfs"}
+ALLOWED_STORAGE_TYPES = {"webdav", "smb", "tgfs"}
+
+def normalize_storage_type(stype: str) -> str:
+    """把历史配置里的存储类型收敛到当前支持集合。
+
+    InfiniCLOUD 专项已移除（免费额度太小、WebDAV 需付费，没有保留价值）。
+    老配置里的 type=infinicloud 一律按普通 WebDAV 处理：它的 url 当年就被
+    归一化成 https://<节点>.teracloud.jp/dav/ 了，直接可用，不会丢配置。
+    """
+    stype = (stype or "webdav").strip().lower()
+    if stype == "infinicloud":
+        return "webdav"
+    return stype if stype in ALLOWED_STORAGE_TYPES else "webdav"
 
 def _read_custom_otp_secret():
     try:
@@ -253,13 +265,7 @@ def normalize_storage_url(stype: str, host_val: str) -> str:
         return ""
     if stype == "tgfs":
         return normalize_tgfs_webdav_url(host_val)
-    if stype == "infinicloud":
-        if not host_val.startswith("http"):
-            host_val = f"https://{host_val}.teracloud.jp" if "." not in host_val else f"https://{host_val}"
-        if not host_val.endswith("/dav"):
-            host_val += "/dav"
-        host_val += "/"
-    elif stype == "webdav":
+    if stype == "webdav":
         if not host_val.startswith("http"):
             host_val = f"https://{host_val}"
         if not host_val.endswith("/"):
@@ -296,7 +302,7 @@ def write_rclone_conf(storages: list):
     for s in storages:
         sid = s.get("id", "")
         rname = remote_name_of(sid)
-        stype = s.get("type", "webdav")
+        stype = normalize_storage_type(s.get("type"))
         url = s.get("url", "")
         user = s.get("user", "")
         plain_pass = s.get("_plain_pass", "") or s.get("pass", "")
@@ -308,7 +314,7 @@ def write_rclone_conf(storages: list):
             if "\n" in user or "\r" in user:
                 raise ValueError("TGFS WebDAV 用户名非法")
         lines.append(f"[{rname}]")
-        if stype in ("infinicloud", "webdav", "tgfs"):
+        if stype in ("webdav", "tgfs"):
             lines.append("type = webdav")
             lines.append(f"url = {url}")
             lines.append("vendor = other")
@@ -1256,7 +1262,7 @@ def get_config():
     storages_out = [{
         "id": s.get("id", ""),
         "name": s.get("name", ""),
-        "type": s.get("type", "webdav"),
+        "type": normalize_storage_type(s.get("type")),
         "url": s.get("url", ""),
         "user": s.get("user", ""),
         "has_pass": bool(existing_passes.get(remote_name_of(s.get("id", "")))),
@@ -1302,7 +1308,7 @@ def save_config(payload: ConfigPayload):
     clean_storages = []
     for s in payload.storages:
         sid = s.get("id", "") or str(uuid.uuid4())[:8]
-        stype = s.get("type", "webdav")
+        stype = normalize_storage_type(s.get("type"))
         if stype not in ALLOWED_STORAGE_TYPES:
             raise HTTPException(status_code=422, detail=f"不支持的存储类型: {stype}")
         try:
@@ -1324,6 +1330,8 @@ def save_config(payload: ConfigPayload):
         write_rclone_conf(clean_storages)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # rclone.conf 变了，常驻的预览 serve 还握着旧凭据，必须重启并清掉目录缓存
+    stop_lib_servers()
     cfg["_ui_storages"] = [{k: v for k, v in s.items() if k != "_plain_pass"} for s in clean_storages]
     cfg["_ui_delete_after_upload"] = payload.delete_after_upload
 
@@ -1427,7 +1435,9 @@ def test_storage(req: TestStorageReq):
             remote_dir = s.get("remote_dir", "tg_backup")
             break
     cfg = load_config()
-    stype = next((s.get("type") for s in cfg.get("_ui_storages", []) if s.get("id") == sid), "webdav")
+    stype = normalize_storage_type(
+        next((s.get("type") for s in cfg.get("_ui_storages", []) if s.get("id") == sid), "webdav")
+    )
 
     try:
         if stype == "tgfs":
@@ -1526,32 +1536,241 @@ def get_logs():
         "logs": list(engine_logs), "stats": session_stats,
     }
 
-@app.get("/api/media", dependencies=[Depends(verify_auth)])
-def list_media():
-    root = Path(load_config().get("save_path", "/app/save"))
-    if not root.exists():
-        return []
+# ==================== 预览库：直接读网盘，不读容器本地 ====================
+# 引擎上传成功后默认会删掉本地文件（_ui_delete_after_upload），容器里本来就常年是空的；
+# 而每个存储方案（网盘账号1 / 网盘账号2 / webdav1 / tgfs …）各自有一份远端目录，
+# 所以预览库按「存储方案」分类，逐个 remote 去列目录、拉流。
+
+LIB_SERVE_HOST = "127.0.0.1"
+LIB_SERVE_BASE_PORT = 8901          # 每个存储一个只读 serve，端口按存储顺序递增
+LIB_LIST_TTL = 90                   # 目录列举缓存（秒）
+LIB_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic"}
+LIB_VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".flv"}
+LIB_MEDIA_EXT = LIB_IMAGE_EXT | LIB_VIDEO_EXT
+
+_lib_servers: dict = {}
+_lib_list_cache: dict = {}
+_lib_lock = threading.Lock()
+
+
+def _lib_storage(sid: str, cfg: dict) -> dict:
+    st = next((s for s in cfg.get("_ui_storages", []) if s.get("id") == sid), None)
+    if not st:
+        raise HTTPException(status_code=404, detail="存储不存在，请先在「存储设置」里添加")
+    return st
+
+
+def _lib_port(sid: str, cfg: dict) -> int:
+    ids = [s.get("id") for s in cfg.get("_ui_storages", [])]
+    return LIB_SERVE_BASE_PORT + (ids.index(sid) if sid in ids else 0)
+
+
+def stop_lib_servers():
+    """存储配置变更后必须重启 serve：进程启动时就把凭据读进内存了。"""
+    with _lib_lock:
+        for rec in _lib_servers.values():
+            proc = rec.get("proc")
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        _lib_servers.clear()
+        _lib_list_cache.clear()
+
+
+def ensure_lib_server(sid: str) -> int:
+    """为某个存储懒启动一个只读 rclone serve http，返回本地端口。
+
+    不用「每张图起一次 rclone cat」：那样每张图都要新建进程 + 重新建连，
+    一屏几十张图就会把 WebDAV 打到限流。常驻 serve 复用连接，而且原生支持
+    Range（视频能拖动进度条），面板只做流式转发。
+    """
+    cfg = load_config()
+    _lib_storage(sid, cfg)
+    port = _lib_port(sid, cfg)
+    with _lib_lock:
+        rec = _lib_servers.get(sid)
+        if rec and rec.get("port") == port and rec.get("proc") and rec["proc"].poll() is None:
+            return port
+        if rec and rec.get("proc") and rec["proc"].poll() is None:
+            try:
+                rec["proc"].terminate()
+            except Exception:
+                pass
+        proc = subprocess.Popen(
+            [RCLONE_BIN, "serve", "http", f"{remote_name_of(sid)}:",
+             "--addr", f"{LIB_SERVE_HOST}:{port}", "--read-only",
+             "--log-level", "ERROR", "--dir-cache-time", "30s"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        _lib_servers[sid] = {"proc": proc, "port": port, "at": time.time()}
+    for _ in range(60):
+        try:
+            with socket.create_connection((LIB_SERVE_HOST, port), timeout=0.4):
+                return port
+        except OSError:
+            time.sleep(0.25)
+    raise HTTPException(status_code=503, detail="存储预览服务启动超时，请检查该网盘的地址与凭据")
+
+
+def _lib_scan(sid: str, st: dict, refresh: bool = False) -> list:
+    """列出某存储 remote_dir 下所有媒体文件（带 TTL 缓存）。"""
+    now = time.time()
+    cached = _lib_list_cache.get(sid)
+    if not refresh and cached and now - cached["at"] < LIB_LIST_TTL:
+        return cached["files"]
+    base = (st.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
+    spec = f"{remote_name_of(sid)}:{base}"
+    try:
+        res = subprocess.run([RCLONE_BIN, "lsjson", "-R", "--files-only", spec],
+                             capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="列举网盘目录超时，请稍后重试") from None
+    if res.returncode != 0:
+        tail = (res.stderr or "").strip().splitlines()
+        raise HTTPException(status_code=502,
+                            detail=f"列举网盘目录失败：{tail[-1] if tail else '未知错误'}")
+    try:
+        raw = json.loads(res.stdout or "[]")
+    except ValueError:
+        raw = []
     files = []
-    for p in sorted(root.rglob("*"), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True):
-        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mkv", ".mov", ".webm"}:
-            files.append({
-                "name": p.name, "rel_path": p.relative_to(root).as_posix(),
-                "type": "video" if p.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"} else "image",
-                "size_mb": round(p.stat().st_size / (1024*1024), 2),
-                "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime)),
-            })
-            if len(files) >= 200:
-                break
+    for it in raw:
+        if it.get("IsDir"):
+            continue
+        rel = (it.get("Path") or "").replace("\\", "/").lstrip("/")
+        name = it.get("Name") or rel.rsplit("/", 1)[-1]
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in LIB_MEDIA_EXT:
+            continue
+        files.append({
+            "name": name,
+            "path": rel,
+            "dir": rel.rsplit("/", 1)[0] if "/" in rel else "",
+            "type": "video" if ext in LIB_VIDEO_EXT else "image",
+            "size_mb": round(int(it.get("Size") or 0) / 1048576, 2),
+            # ISO8601 字符串按字典序排即按时间排，省一次解析
+            "mtime": (it.get("ModTime") or "")[:19].replace("T", " "),
+        })
+    files.sort(key=lambda x: (x["mtime"], x["path"]), reverse=True)
+    _lib_list_cache[sid] = {"at": now, "files": files}
     return files
 
-@app.get("/api/stream", dependencies=[Depends(verify_auth)])
-def stream_media(path: str):
-    root = Path(load_config().get("save_path", "/app/save")).resolve()
-    target = (root / path).resolve()
-    if not str(target).startswith(str(root)) or not target.is_file():
-        raise HTTPException(status_code=404)
-    mime, _ = mimetypes.guess_type(str(target))
-    return FileResponse(target, media_type=mime or "application/octet-stream")
+
+def _safe_rel(path: str) -> str:
+    p = (path or "").replace("\\", "/").strip().lstrip("/")
+    if not p or ".." in p.split("/"):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    return p
+
+
+@app.get("/api/library/sources", dependencies=[Depends(verify_auth)])
+def library_sources():
+    """预览库的分类：一个存储方案一项（网盘账号1 / 网盘账号2 / webdav1 / tgfs …）。"""
+    cfg = load_config()
+    title_map = cfg.get("_ui_chat_titles", {})
+    passes = get_existing_rclone_passes()
+    out = []
+    for s in cfg.get("_ui_storages", []):
+        sid = s.get("id", "")
+        out.append({
+            "id": sid,
+            "name": s.get("name") or f"网盘_{sid[:4]}",
+            "type": normalize_storage_type(s.get("type")),
+            "remote_dir": s.get("remote_dir", "tg_backup"),
+            "has_pass": bool(passes.get(remote_name_of(sid))),
+            "chats": [title_map.get(str(c.get("chat_id")), str(c.get("chat_id")))
+                      for c in cfg.get("chat", []) if c.get("_storage_id") == sid],
+        })
+    return {"sources": out, "count": len(out)}
+
+
+@app.get("/api/library", dependencies=[Depends(verify_auth)])
+def library_list(sid: str, q: str = "", kind: str = "", dir: str = "",
+                 limit: int = 120, offset: int = 0, refresh: bool = False):
+    cfg = load_config()
+    st = _lib_storage(sid, cfg)
+    files = _lib_scan(sid, st, refresh=refresh)
+
+    kw = (q or "").strip().lower()
+    if kw:
+        files = [f for f in files if kw in f["name"].lower() or kw in f["dir"].lower()]
+    if kind in ("image", "video"):
+        files = [f for f in files if f["type"] == kind]
+
+    # 路径分类（存储内部的一级目录），用于筛选 chips
+    dir_count: dict = {}
+    for f in files:
+        top = f["dir"].split("/")[0] if f["dir"] else "(根目录)"
+        dir_count[top] = dir_count.get(top, 0) + 1
+
+    if dir:
+        want = dir.strip("/")
+        files = [f for f in files
+                 if (f["dir"].split("/")[0] if f["dir"] else "(根目录)") == want]
+
+    limit = max(1, min(int(limit or 120), 400))
+    offset = max(0, int(offset or 0))
+    page = files[offset:offset + limit]
+    return {
+        "sid": sid,
+        "name": st.get("name") or sid,
+        "type": normalize_storage_type(st.get("type")),
+        "remote_dir": st.get("remote_dir", "tg_backup"),
+        "total": len(files),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < len(files),
+        "dirs": [{"name": k, "count": v}
+                 for k, v in sorted(dir_count.items(), key=lambda x: -x[1])][:80],
+        "items": page,
+    }
+
+
+@app.get("/api/library/raw", dependencies=[Depends(verify_auth)])
+async def library_raw(sid: str, path: str, request: Request):
+    """把网盘文件流式转发给浏览器，转发 Range 以支持视频拖动进度条。"""
+    cfg = load_config()
+    st = _lib_storage(sid, cfg)
+    rel = _safe_rel(path)
+    port = ensure_lib_server(sid)
+    # serve 挂在 remote 根上，而 lsjson 返回的 Path 是相对 remote_dir 的，这里要补回前缀
+    base = (st.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
+    url = f"http://{LIB_SERVE_HOST}:{port}/" + quote(f"{base}/{rel}")
+
+    fwd = {}
+    rng = request.headers.get("range")
+    if rng:
+        fwd["range"] = rng
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0))
+    try:
+        upstream = await client.send(client.build_request("GET", url, headers=fwd), stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"读取网盘文件失败：{exc}") from exc
+    if upstream.status_code >= 400:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=404, detail="网盘上找不到该文件")
+
+    headers = {"cache-control": "private, max-age=86400"}
+    for h in ("content-type", "content-length", "content-range",
+              "accept-ranges", "last-modified", "etag"):
+        v = upstream.headers.get(h)
+        if v:
+            headers[h] = v
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
 
 @app.get("/", response_class=HTMLResponse)
 def index():
