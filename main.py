@@ -1,4 +1,4 @@
-import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio
+import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
@@ -61,6 +61,7 @@ engine_thread: Optional[threading.Thread] = None
 stop_event = threading.Event()
 pending_auth = {"client": None, "phone": None, "phone_code_hash": None}
 
+_config_cache = {}   # 配置解析成功后的快照，用于读失败时兜底
 engine_logs = deque(maxlen=500)
 session_stats = {"downloaded_count": 0, "last_file": "", "start_time": 0}
 
@@ -114,12 +115,40 @@ if VENDOR_DIR.exists():
 # ==================== 配置读写 ====================
 
 def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.load(f) or {}
+    """读取配置。
+
+    解析失败通常是并发写入读到半截 YAML 的瞬时情况：重试一次，仍失败则
+    回退到上次成功解析的快照，避免整个面板直接 500。
+    """
+    global _config_cache
+    for attempt in (1, 2):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = yaml.load(f) or {}
+            _config_cache = cfg
+            return cfg
+        except Exception as e:
+            if attempt == 1:
+                time.sleep(0.25)
+                continue
+            print(f"[配置] 读取失败（{e}），回退到上次成功快照")
+            try:
+                return copy.deepcopy(_config_cache) if _config_cache else {}
+            except Exception:
+                return {}
 
 def dump_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    """原子写配置：先写临时文件再 os.replace。
+
+    之前是「open(w) 直接写」，写入期间并发读会拿到半截 YAML，
+    ruamel 解析直接抛 IndexError，表现为接口 500。
+    """
+    tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_PATH)
 
 def link_engine_config(target: Path):
     """把 /app/config.yaml 指向指定配置文件（引擎按相对路径读取此文件）"""
@@ -293,11 +322,14 @@ def write_rclone_conf(storages: list):
         lines.append(f"user = {user}")
         lines.append(f"pass = {obs_pass}")
         lines.append("")
-    RCLONE_CONF_PATH.write_text("\n".join(lines), encoding="utf-8")
+    # 原子写：rclone 可能在别处并发读取，截断写会读到半截配置
+    rtmp = RCLONE_CONF_PATH.with_suffix(".conf.tmp")
+    rtmp.write_text("\n".join(lines), encoding="utf-8")
     try:
-        os.chmod(RCLONE_CONF_PATH, 0o600)
+        os.chmod(rtmp, 0o600)
     except OSError:
         pass
+    os.replace(rtmp, RCLONE_CONF_PATH)
 
 def get_all_rclone_quotas() -> list:
     if not RCLONE_CONF_PATH.exists():
@@ -451,8 +483,13 @@ def run_all_groups():
             run_cfg["save_path"] = f"{base_save_path}/{sub_path}" if sub_path else base_save_path
 
             tmp = Path(f"/app/config_store/_run_group_{idx}.yaml")
-            with open(tmp, "w", encoding="utf-8") as f:
+            # 先写 .tmp 再 replace：引擎随时可能读到这份配置，避免半截 YAML
+            gtmp = tmp.with_suffix(".yaml.tmp")
+            with open(gtmp, "w", encoding="utf-8") as f:
                 yaml.dump(run_cfg, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(gtmp, tmp)
             link_engine_config(tmp)
 
             proc = subprocess.Popen(
@@ -866,23 +903,125 @@ async def tg_verify_code(req: VerifyCodeReq):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/api/tg/dialogs", dependencies=[Depends(verify_auth)])
-async def tg_list_dialogs():
+async def fetch_dialog_list() -> List[dict]:
+    """拉取 TG 侧全部频道/群组，按 chat_id 去重（同一 chat 只保留一条）。
+
+    Pyrogram 的 get_dialogs 默认只返回 100 条，这里放开上限，
+    否则账号里频道一多就采不全。replies=0 避免拉进群组回复消息。
+    """
     client = build_pyrogram_client()
-    dialogs = []
+    dialogs, seen = [], set()
     try:
         await client.connect()
-        async for d in client.get_dialogs():
-            if d.chat.type in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
-                dialogs.append({"chat_id": d.chat.id, "title": d.chat.title or "未命名", "username": d.chat.username or "", "type": "频道" if d.chat.type == ChatType.CHANNEL else "群组"})
-        return {"ok": True, "dialogs": dialogs}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        async for d in client.get_dialogs(limit=1000):
+            if d.chat.type not in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
+                continue
+            cid = d.chat.id
+            if cid in seen:
+                continue
+            seen.add(cid)
+            dialogs.append({
+                "chat_id": cid,
+                "title": d.chat.title or "未命名",
+                "username": d.chat.username or "",
+                "type": "频道" if d.chat.type == ChatType.CHANNEL else "群组",
+            })
+        return dialogs
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
+
+@app.get("/api/tg/dialogs", dependencies=[Depends(verify_auth)])
+async def tg_list_dialogs():
+    try:
+        dialogs = await fetch_dialog_list()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"拉取频道列表失败：{e}")
+    cfg = load_config()
+    existing = {str(c.get("chat_id")): c for c in cfg.get("chat", [])}
+    for d in dialogs:
+        c = existing.get(str(d["chat_id"]))
+        d["added"] = c is not None
+        d["last_read_message_id"] = int(c.get("last_read_message_id", 0)) if c else 0
+        d["storage_id"] = c.get("_storage_id", "") if c else ""
+    return {"ok": True, "dialogs": dialogs, "total": len(dialogs),
+            "added_count": sum(1 for d in dialogs if d["added"])}
+
+class CollectReq(BaseModel):
+    chat_ids: List[int] = []
+    storage_id: str = ""
+    storage_path: str = ""
+    start_id: int = 0      # 0 = 从最旧开始，补齐该频道全部历史
+    start_engine: bool = False
+
+@app.post("/api/tg/collect", dependencies=[Depends(verify_auth)])
+async def tg_collect(req: CollectReq):
+    """一键采集：把选中的频道批量加入监控队列。
+
+    - 已存在于队列的频道自动跳过（重复信息不重复添加）
+    - 落库前对整个 chat 列表按 chat_id 再去重一次
+    - start_id=0 表示起始水位线归零，引擎会从最旧的历史消息一路补到最新
+    """
+    try:
+        dialogs = await fetch_dialog_list()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"拉取频道列表失败：{e}")
+
+    wanted = {str(int(x)) for x in (req.chat_ids or [])}
+    cfg = load_config()
+    existing = {str(c.get("chat_id")) for c in cfg.get("chat", [])}
+    titles = dict(cfg.get("_ui_chat_titles", {}))
+    added, skipped, not_found = [], [], []
+
+    for d in dialogs:
+        key = str(d["chat_id"])
+        if key not in wanted:
+            continue
+        if key in existing:
+            skipped.append({"chat_id": d["chat_id"], "title": d["title"], "reason": "已在队列中，已自动跳过"})
+            continue
+        entry = {"chat_id": d["chat_id"], "last_read_message_id": int(req.start_id)}
+        if req.storage_id:
+            entry["_storage_id"] = req.storage_id
+        sub = clean_sub_path(req.storage_path)
+        if sub:
+            entry["_path"] = sub
+        cfg.setdefault("chat", []).append(entry)
+        titles[key] = d["title"]
+        existing.add(key)
+        added.append({"chat_id": d["chat_id"], "title": d["title"], "type": d["type"]})
+
+    for x in wanted - {str(d["chat_id"]) for d in dialogs}:
+        not_found.append(int(x))
+
+    # 落库前统一去重：同一个 chat_id 只保留第一条
+    seen, deduped = set(), []
+    for c in cfg.get("chat", []):
+        k = str(c.get("chat_id"))
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(c)
+    removed = len(cfg.get("chat", [])) - len(deduped)
+    cfg["chat"] = deduped
+    cfg["_ui_chat_titles"] = titles
+    dump_config(cfg)
+    link_engine_config(CONFIG_PATH)
+
+    if req.start_engine:
+        control_engine("start")
+
+    return {
+        "ok": True,
+        "added": added,
+        "skipped": skipped,
+        "not_found": not_found,
+        "dedup_removed": removed,
+        "total": len(deduped),
+        "start_id": int(req.start_id),
+    }
 
 # ==================== 配置 API ====================
 
@@ -995,11 +1134,15 @@ def save_config(payload: ConfigPayload):
     # --- 频道 + 存储路由 ---
     clean_chats, title_map = [], {}
     storage_by_id = {s["id"]: s for s in clean_storages}
+    seen_chat_ids = set()  # 同一个 chat_id 只保留一条，自动去掉重复
     for c in payload.chats:
         cid_raw = str(c.get("chat_id", "")).strip()
         if cid_raw == "":
             continue
         cid = int(cid_raw) if cid_raw.lstrip("-").isdigit() else cid_raw
+        if cid in seen_chat_ids:
+            continue
+        seen_chat_ids.add(cid)
         sid = c.get("storage_id", "")
         if sid and sid not in storage_by_id:
             sid = ""

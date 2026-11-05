@@ -154,6 +154,11 @@ body {
 .qb-remember-sub { font-size:11px; color:var(--ink-soft); line-height:1.65; margin-top:3px; }
 .qb-kv { display:flex; flex-wrap:wrap; gap:8px 20px; font-size:12px; color:var(--ink-soft); margin-top:10px; }
 .qb-kv b { color:var(--ink); font-weight:700; }
+.qb-pick { display:flex; gap:9px; align-items:center; font-size:13px; color:var(--ink); padding:6px 9px; border-radius:9px; cursor:pointer; }
+.qb-pick:hover { background:rgba(255,255,255,.62); }
+.qb-pick input { width:15px; height:15px; accent-color:#4a8550; cursor:pointer; flex:none; }
+.qb-pick .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.qb-list-pick { max-height:190px; overflow-y:auto; margin-top:10px; border-radius:11px; background:rgba(255,255,255,.42); border:1px solid rgba(255,255,255,.8); padding:6px; }
 .qb-input:disabled { opacity:.55; cursor:not-allowed; }
 ::-webkit-scrollbar { width:8px; height:8px; }
 ::-webkit-scrollbar-track { background:transparent; }
@@ -316,18 +321,83 @@ body {
         </div>
       </section>
 
+      <!-- 一键采集新频道：批量加入监控队列，并可补齐历史 -->
+      <div v-if="scanOpen" class="qb-panel qb-scan-panel">
+        <div class="qb-panel-head">
+          <div>
+            <div class="qb-panel-title">
+              🧲 一键采集新频道
+              <span class="qb-tag qb-tag-warn">发现 {{ newDialogs.length }} 个未添加</span>
+            </div>
+            <div class="qb-hint" style="margin-top:4px">已在监控队列里的频道会自动跳过，不会重复添加。</div>
+          </div>
+          <button @click="scanOpen = false" class="qb-btn qb-btn-soft qb-btn-sm">收起</button>
+        </div>
+        <div class="qb-panel-body">
+          <div class="qb-alert warn qb-panel-note">
+            <div class="qb-alert-title">起始 ID 决定要不要补历史</div>
+            <div>填 <b>0</b> 表示水位线归零，引擎会从该频道<b>最旧的历史消息</b>一路采到最新（历史量大时耗时长）；
+            填具体 ID 则只采集该 ID 之后的新消息。</div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3" style="margin-top:12px">
+            <div>
+              <label class="qb-field-label">新频道存储目标</label>
+              <select v-model="collect.storage_id" class="qb-input">
+                <option value="">📁 本地存储</option>
+                <option v-for="s in cfg.storages" :key="s.id" :value="s.id">☁️ {{ s.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="qb-field-label">子目录（可选）</label>
+              <input v-model="collect.storage_path" placeholder="如 科技/2026" class="qb-input">
+            </div>
+            <div>
+              <label class="qb-field-label">起始 ID（0 = 全部历史）</label>
+              <input type="number" v-model.number="collect.start_id" placeholder="0" class="qb-input">
+            </div>
+          </div>
+          <label class="qb-check" style="margin-top:12px"><input type="checkbox" v-model="collect.start_engine"> 采集完成后立即启动引擎</label>
+          <div class="qb-alert qb-panel-note">
+            <div>默认只勾选<b>频道</b>类型：群组的历史消息量通常极大，全量补采可能长时间占满带宽与网盘，确认需要再手动勾选。</div>
+          </div>
+          <div class="qb-list-pick">
+            <label v-for="d in newDialogs" :key="d.chat_id" class="qb-pick">
+              <input type="checkbox" :value="d.chat_id" v-model="collect.selected">
+              <span class="t">{{ d.title }}</span>
+              <span class="qb-hint">{{ d.type }}</span>
+            </label>
+            <div v-if="!newDialogs.length" class="qb-hint" style="text-align:center;padding:14px 0">没有新的频道了 —— 已添加的频道会自动去重</div>
+          </div>
+          <div class="flex gap-2 items-center flex-wrap" style="margin-top:12px">
+            <button @click="collectAllNew" :disabled="collectBusy || !collect.selected.length" class="qb-btn qb-btn-primary">⚡ 一键采集 {{ collect.selected.length }} 个频道</button>
+            <button @click="selectChannelsOnly" class="qb-btn qb-btn-soft qb-btn-sm">仅选频道</button>
+            <button @click="selectAllNew" class="qb-btn qb-btn-soft qb-btn-sm">全选（含群组）</button>
+            <button @click="selectNone" class="qb-btn qb-btn-soft qb-btn-sm">清空</button>
+            <span v-if="collectBusy" class="qb-hint">采集中，请稍候…</span>
+          </div>
+          <div v-if="collectMsg" class="qb-msg" :class="collectMsgOk ? 'ok' : 'err'">{{ collectMsg }}</div>
+        </div>
+      </div>
+
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <section class="qb-card accent-mint flex flex-col h-[520px]">
           <div class="flex justify-between items-center pb-2 border-b border-slate-200">
-            <span class="qb-card-title" style="margin-bottom:0">📡 已加入频道</span>
-            <button @click="fetchDialogs" class="qb-btn qb-btn-info qb-btn-sm">刷新频道</button>
+            <span class="qb-card-title" style="margin-bottom:0">📡 TG 频道</span>
+            <div class="flex gap-2">
+              <button @click="scanDialogs" class="qb-btn qb-btn-primary qb-btn-sm">🔍 扫描新频道</button>
+              <button @click="fetchDialogs" class="qb-btn qb-btn-info qb-btn-sm">刷新</button>
+            </div>
           </div>
           <input v-model="dialogSearch" placeholder="搜索..." class="qb-input my-2">
-          <div class="flex-1 overflow-y-auto space-y-2">
-            <div v-for="d in filteredDialogs" :key="d.chat_id" class="qb-subcard flex justify-between items-center text-sm">
-              <span class="truncate pr-2">{{ d.title }}</span>
-              <button @click="addChat(d)" class="qb-btn qb-btn-primary qb-btn-sm">+ 添加</button>
+          <div class="flex-1 overflow-y-auto space-y-2 qb-channel-list">
+            <div v-for="d in filteredDialogs" :key="d.chat_id" class="qb-subcard flex justify-between items-center text-sm" :style="d.added ? 'opacity:.6' : ''">
+              <span class="truncate pr-2">{{ d.title }}
+                <span v-if="d.added" class="qb-tag qb-tag-ok" style="margin-left:6px">已添加</span>
+              </span>
+              <button v-if="!d.added" @click="addChat(d)" class="qb-btn qb-btn-primary qb-btn-sm">+ 添加</button>
+              <span v-else class="qb-hint">起始ID {{ d.last_read_message_id }}</span>
             </div>
+            <div v-if="!filteredDialogs.length" class="qb-hint" style="text-align:center;padding:18px 0">点「扫描新频道」拉取账号里的频道清单</div>
           </div>
         </section>
         <section class="qb-card accent-citrus flex flex-col h-[520px]">
@@ -599,7 +669,7 @@ const { createApp } = Vue;
 createApp({
   data() {
     return {
-      authed: false, otpCode: '', errMsg: '', tab: 'tg',
+      authed: false, otpCode: '', errMsg: '', cfgErr: '', tab: 'tg',
       remember30d: true,
       session: { days: 1, long_lived: false, expires_at: 0, remain_days: 0, remain_seconds: 0 },
       cfg: {
@@ -610,6 +680,8 @@ createApp({
       tgStatus: { logged_in: false }, loginPhone: '', codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
       proxyOpen: true, proxyBusy: false, proxyMsg: '', proxyMsgOk: true,
       tgBusy: false, tgMsg: '', tgMsgOk: true,
+      scanOpen: false, collectBusy: false, collectMsg: '', collectMsgOk: true,
+      collect: { selected: [], storage_id: '', storage_path: '', start_id: 0, start_engine: false },
       dialogs: [], dialogSearch: '', logs: [], mediaList: [],
       // OTP 换绑状态
       otp: { source: 'env', step: 1, resetOpen: false },
@@ -622,6 +694,9 @@ createApp({
     filteredDialogs() {
       const q = this.dialogSearch.toLowerCase();
       return q ? this.dialogs.filter(d => d.title.toLowerCase().includes(q) || String(d.chat_id).includes(q)) : this.dialogs;
+    },
+    newDialogs() {
+      return this.dialogs.filter(d => !d.added);
     }
   },
   mounted() { this.fetchConfig(); setInterval(() => { if(this.authed && this.tab==='notify') this.fetchLogs(); }, 3000); },
@@ -661,7 +736,9 @@ createApp({
     async fetchConfig() {
       const res = await fetch('/api/config');
       if (res.status === 401) { this.authed = false; return; }
-      const d = await res.json();
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) { this.cfgErr = d.detail || '读取配置失败'; return; }
+      this.cfgErr = '';
       const defaults = {
         chats: [], storages: [], proxy_enable: false, proxy_scheme: 'socks5',
         proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false
@@ -744,7 +821,59 @@ createApp({
     },
     async fetchDialogs() {
       const res = await fetch('/api/tg/dialogs');
-      if (res.ok) this.dialogs = (await res.json()).dialogs;
+      if (res.ok) this.dialogs = (await res.json()).dialogs || [];
+    },
+    setCollectMsg(text, ok) { this.collectMsg = text; this.collectMsgOk = !!ok; },
+    async scanDialogs() {
+      this.scanOpen = true;
+      this.collectMsg = '';
+      await this.fetchDialogs();
+      const first = (this.cfg.chats || [])[0];
+      if (!this.collect.storage_id && first && first.storage_id) this.collect.storage_id = first.storage_id;
+      this.collect.selected = this.newDialogs.filter(d => d.type === '频道').map(d => d.chat_id);
+    },
+    selectAllNew() {
+      this.collect.selected = this.newDialogs.map(d => d.chat_id);
+    },
+    selectChannelsOnly() {
+      this.collect.selected = this.newDialogs.filter(d => d.type === '频道').map(d => d.chat_id);
+    },
+    selectNone() {
+      this.collect.selected = [];
+    },
+    async collectAllNew() {
+      this.collectBusy = true; this.collectMsg = '';
+      try {
+        const res = await fetch('/api/tg/collect', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            chat_ids: this.collect.selected,
+            storage_id: this.collect.storage_id || '',
+            storage_path: this.collect.storage_path || '',
+            start_id: Number(this.collect.start_id) || 0,
+            start_engine: !!this.collect.start_engine
+          })
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.setCollectMsg(d.detail || '采集失败', false);
+        } else {
+          const skipped = (d.skipped || []).length;
+          const dedup = d.dedup_removed || 0;
+          let msg = `新增 ${(d.added || []).length} 个频道`;
+          if (skipped) msg += `，跳过重复 ${skipped} 个`;
+          if ((d.not_found || []).length) msg += `，未在 TG 中找到 ${d.not_found.length} 个`;
+          if (dedup) msg += `，清理重复记录 ${dedup} 条`;
+          if (Number(d.start_id) === 0) msg += '；起始 ID = 0，将补齐这些频道的全部历史媒体';
+          this.setCollectMsg(msg, true);
+          this.collect.selected = [];
+          await this.fetchConfig();
+          await this.fetchDialogs();
+        }
+      } catch (e) {
+        this.setCollectMsg('请求失败：' + e, false);
+      }
+      this.collectBusy = false;
     },
     isChatSelected(id) { return this.cfg.chats.some(c => String(c.chat_id) === String(id)); },
     addChat(d) {
