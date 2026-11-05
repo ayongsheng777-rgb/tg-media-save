@@ -433,6 +433,7 @@ body {
             </div>
           </div>
           <input v-model="dialogSearch" placeholder="搜索..." class="qb-input my-2">
+          <div v-if="dialogsError" class="qb-msg err">{{ dialogsError }}</div>
           <div class="flex-1 overflow-y-auto space-y-2 qb-channel-list">
             <div v-for="d in filteredDialogs" :key="d.chat_id" class="qb-subcard flex justify-between items-center text-sm" :style="d.added ? 'opacity:.6' : ''">
               <span class="truncate pr-2">{{ d.title }}
@@ -1044,7 +1045,7 @@ createApp({
       codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
       proxyBusy: false, proxyMsg: '', proxyMsgOk: true,
       tgBusy: false, tgMsg: '', tgMsgOk: true,
-      scanOpen: false, collectBusy: false, collectMsg: '', collectMsgOk: true,
+      scanOpen: false, collectBusy: false, collectMsg: '', collectMsgOk: true, dialogsError: '',
       collect: { selected: [], storage_id: '', storage_path: '', start_id: 0 },
       historyBusy: false, historyMsg: '', historyMsgOk: true,
       history: { selected: [], reset_watermark: true, start_engine: true },
@@ -1381,14 +1382,27 @@ createApp({
       this.setTgMsg('已取消本次登录会话，可重新发送验证码', true);
     },
     async fetchDialogs() {
-      const res = await fetch('/api/tg/dialogs');
-      if (res.ok) this.dialogs = (await res.json()).dialogs || [];
+      // 之前这里失败时一声不吭（res 不 ok 就直接跳过），
+      // 后端一报 400，前台就只剩空白列表，用户完全不知道为什么。
+      // 现在失败要把原因写出来，并返回 false 让调用方别再往下走。
+      try {
+        const res = await fetch('/api/tg/dialogs');
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.detail || ('扫描失败（' + res.status + '）'));
+        this.dialogs = d.dialogs || [];
+        this.dialogsError = '';
+        return true;
+      } catch (e) {
+        this.dialogsError = '扫描失败：' + e.message + '，请重试一次';
+        this.setCollectMsg(this.dialogsError, false);
+        return false;
+      }
     },
     setCollectMsg(text, ok) { this.collectMsg = text; this.collectMsgOk = !!ok; },
     async scanDialogs() {
       this.scanOpen = true;
       this.collectMsg = '';
-      await this.fetchDialogs();
+      if (!await this.fetchDialogs()) return;
       const first = (this.cfg.chats || [])[0];
       if (!this.collect.storage_id && first && first.storage_id) this.collect.storage_id = first.storage_id;
       this.collect.selected = this.newDialogs.filter(d => d.type === '频道').map(d => d.chat_id);
