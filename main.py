@@ -973,9 +973,9 @@ def otp_reset(req: OtpCodeReq):
 
 # ==================== TG 客户端 ====================
 
-def build_pyrogram_client() -> Client:
+def build_pyrogram_client(workdir=None) -> Client:
     cfg = load_config()
-    return Client(name=SESSION_NAME, api_id=int(cfg["api_id"]), api_hash=str(cfg["api_hash"]), workdir=str(SESSION_STORE_DIR), proxy=cfg.get("proxy"))
+    return Client(name=SESSION_NAME, api_id=int(cfg["api_id"]), api_hash=str(cfg["api_hash"]), workdir=str(workdir or SESSION_STORE_DIR), proxy=cfg.get("proxy"))
 
 def get_login_state() -> dict:
     """TG 账号登录态（手机号 / 是否已授权 / 昵称），持久化在 config.yaml 的 _ui_login。
@@ -1217,30 +1217,53 @@ async def fetch_dialog_list() -> List[dict]:
 
     Pyrogram 的 get_dialogs 默认只返回 100 条，这里放开上限，
     否则账号里频道一多就采不全。replies=0 避免拉进群组回复消息。
+
+    为什么要先把会话文件拷一份到临时目录再连：
+    引擎（media_downloader.py 子进程）运行时一直占着会话文件，
+    Pyrogram 打开会话要在 SQLite 上写版本号，会直接报
+    "database is locked"，扫描就 400、前台一片空白。
+    get_dialogs 走的是服务端接口，本地会话只用来鉴权，
+    所以拷一份再连，不动正在跑的引擎，扫描和采集可以并行。
+    拷贝可能撞上引擎写盘的瞬间而撕裂，连不上就重拷，最多 3 次。
     """
-    client = build_pyrogram_client()
-    dialogs, seen = [], set()
-    try:
-        await client.connect()
-        async for d in client.get_dialogs(limit=1000):
-            if d.chat.type not in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
-                continue
-            cid = d.chat.id
-            if cid in seen:
-                continue
-            seen.add(cid)
-            dialogs.append({
-                "chat_id": cid,
-                "title": d.chat.title or "未命名",
-                "username": d.chat.username or "",
-                "type": "频道" if d.chat.type == ChatType.CHANNEL else "群组",
-            })
-        return dialogs
-    finally:
+    cfg = load_config()
+    src = SESSION_STORE_DIR / f"{SESSION_NAME}.session"
+    last_err: Optional[Exception] = None
+    for _attempt in range(3):
+        tmpdir = tempfile.mkdtemp(prefix="scan_session_")
         try:
-            await client.disconnect()
-        except Exception:
-            pass
+            shutil.copy2(src, os.path.join(tmpdir, f"{SESSION_NAME}.session"))
+            client = build_pyrogram_client(workdir=tmpdir)
+            dialogs, seen = [], set()
+            try:
+                await client.connect()
+                async for d in client.get_dialogs(limit=1000):
+                    if d.chat.type not in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
+                        continue
+                    cid = d.chat.id
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    dialogs.append({
+                        "chat_id": cid,
+                        "title": d.chat.title or "未命名",
+                        "username": d.chat.username or "",
+                        "type": "频道" if d.chat.type == ChatType.CHANNEL else "群组",
+                    })
+                return dialogs
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(1)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if last_err is not None and "database is locked" in str(last_err):
+        raise RuntimeError("会话文件正被采集引擎占用，拷贝重试 3 次仍打不开；请等引擎停下再扫，或重试一次") from last_err
+    raise last_err if last_err is not None else RuntimeError("拉取频道列表失败：未知错误")
 
 @app.get("/api/tg/dialogs", dependencies=[Depends(verify_auth)])
 async def tg_list_dialogs():
