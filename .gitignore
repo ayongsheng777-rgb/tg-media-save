@@ -5,6 +5,9 @@ config_store/
 sessions/
 downloads/
 rclone/
+# TGFS 的 config.yaml 里有 api_hash / bot token / 网盘密码，
+# account.session 是账号的 session_string —— 泄露等于把账号交出去
+tgfs_data/
 *.session
 *.session-journal
 
