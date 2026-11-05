@@ -338,7 +338,43 @@ def get_rclone_quota_summary() -> str:
 # 频道级覆盖。因此这里按「频道 -> 网盘」分组，串行生成每组的临时 config，
 # 逐组启动引擎；每组结束后把更新后的水位线回写主配置。
 
+def clean_sub_path(raw: str) -> str:
+    """清洗频道级子目录：去掉空段、. 与 ..，防止路径穿越。"""
+    parts = []
+    for seg in (raw or "").replace("\\", "/").split("/"):
+        seg = seg.strip().strip(".")
+        if seg in ("", ".", ".."):
+            continue
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def describe_channel_target(c, title_map, storages_by_id, base_save_path) -> str:
+    """给通知用的一行：频道 → 存储目标 → 完整落盘路径。
+
+    与引擎的路径拼接保持一致：save_path / chat_title / media_datetime，
+    media_datetime 的格式来自引擎 date_format（%Y_%m，即 YYYY_MM）。
+    """
+    cid = str(c.get("chat_id"))
+    title = title_map.get(cid, cid)
+    sub = clean_sub_path(c.get("_path", ""))
+    storage = storages_by_id.get(c.get("_storage_id", ""))
+    if storage:
+        base = (storage.get("remote_dir", "tg_backup") or "tg_backup").strip("/")
+        target = storage.get("name", storage.get("id", ""))
+        rel = "/".join(x for x in [base, sub, title, "YYYY_MM"] if x)
+        return f"• {title} → {target}：`{rel}/`"
+    rel = "/".join(x for x in [base_save_path, sub, title, "YYYY_MM"] if x)
+    return f"• {title} → 本地存储：`{rel}/`"
+
+
 def build_groups(cfg):
+    """按 (存储目标, 频道子目录) 分组。
+
+    上游引擎的 save_path 与 upload_drive.remote_dir 都是「每组一份」的，
+    所以只要按子目录把频道拆成更细的组，就能让每个频道落到自己的路径，
+    无需改动引擎本身。
+    """
     storages = {s["id"]: s for s in cfg.get("_ui_storages", [])}
     groups = {}
     for c in cfg.get("chat", []):
@@ -351,16 +387,21 @@ def build_groups(cfg):
                 f"[{time.strftime('%H:%M:%S')}] ⚠ 频道 {c.get('chat_id')} 指向未授权的 TGFS，本轮改存本地"
             )
             sid = ""
-        groups.setdefault(sid, []).append(c)
+        sub = clean_sub_path(c.get("_path", ""))
+        groups.setdefault((sid, sub), []).append(c)
     return storages, groups
 
-def make_upload_drive(storage, delete_after: bool) -> dict:
+def make_upload_drive(storage, delete_after: bool, sub_path: str = "") -> dict:
     if not storage:
         return {"enable_upload_file": False}
     rname = remote_name_of(storage.get("id", ""))
+    base = (storage.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
+    remote = f"{rname}:{base}"
+    if sub_path:
+        remote += "/" + sub_path.strip("/")
     return {
         "enable_upload_file": True,
-        "remote_dir": f"{rname}:{storage.get('remote_dir', 'tg_backup')}",
+        "remote_dir": remote,
         "upload_adapter": "rclone",
         "rclone_path": RCLONE_BIN,
         "before_upload_file_zip": False,
@@ -387,22 +428,27 @@ def run_all_groups():
             return
 
         delete_after = cfg.get("_ui_delete_after_upload", False)
+        base_save_path = cfg.get("save_path", "/app/save")
         total = len(groups)
         engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 📋 共 {total} 个存储分组，将依次归档")
 
-        for idx, (sid, chats) in enumerate(groups.items()):
+        for idx, ((sid, sub_path), chats) in enumerate(groups.items()):
             if stop_event.is_set():
                 engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⏹ 收到停止信号，中止后续分组")
                 break
 
             label = storages[sid].get("name", sid) if sid else "本地存储"
+            if sub_path:
+                label += f" · {sub_path}"
             engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ▶ [{idx+1}/{total}] {label} · {len(chats)} 个频道")
 
             # 每组生成独立 config，避免私有字段污染引擎
             run_cfg = strip_ui_keys(load_config())
             run_cfg["chat"] = [clean_chat_for_engine(c) for c in chats]
-            run_cfg["upload_drive"] = make_upload_drive(storages.get(sid), delete_after)
+            run_cfg["upload_drive"] = make_upload_drive(storages.get(sid), delete_after, sub_path)
             run_cfg.pop("_ui_delete_after_upload", None)
+            # 频道级子目录：本地根目录也下沉一层，使本地结构与远端 remote_dir 对齐
+            run_cfg["save_path"] = f"{base_save_path}/{sub_path}" if sub_path else base_save_path
 
             tmp = Path(f"/app/config_store/_run_group_{idx}.yaml")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -456,18 +502,16 @@ def run_all_groups():
         if notify_cfg.get("notify_on_task_finish", True) and elapsed > 2:
             latest = load_config()
             title_map = latest.get("_ui_chat_titles", {})
-            storage_names = {s["id"]: s.get("name", s["id"]) for s in latest.get("_ui_storages", [])}
+            storages_by_id = {s["id"]: s for s in latest.get("_ui_storages", [])}
             chat_lines = []
             for c in latest.get("chat", []):
-                sid = c.get("_storage_id", "")
-                target = storage_names.get(sid, "本地存储") if sid else "本地存储"
-                chat_lines.append(f"• {title_map.get(str(c['chat_id']), c['chat_id'])} → {target}")
+                chat_lines.append(describe_channel_target(c, title_map, storages_by_id, base_save_path))
             send_notification(
                 "TG 媒体归档与同步完成",
                 [
                     f"**本轮处理文件数**：`{session_stats['downloaded_count']}` 项",
                     f"**总耗时**：`{elapsed}` 秒",
-                    f"**归档结构**：`频道名称 / 月份(YYYY-MM)`",
+                    "**归档结构**：`子目录 / 频道名称 / YYYY_MM`（子目录为空时省略；月份为媒体发布月份）",
                     "\n".join(chat_lines) if chat_lines else "**频道**：无",
                     f"**网盘状态**：`{get_rclone_quota_summary()}`"
                 ]
@@ -525,13 +569,12 @@ def send_notification(title: str, content_lines: List[str]) -> dict:
 
 # ==================== 鉴权 ====================
 
-def verify_auth(request: Request):
+def verify_auth(request: Request) -> dict:
     token = request.cookies.get("tg_device_token")
     if not token:
         raise HTTPException(status_code=401, detail="未登录")
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return True
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except Exception:
         raise HTTPException(status_code=401, detail="凭证无效")
 
@@ -543,14 +586,44 @@ class LoginReq(BaseModel):
 def login(req: LoginReq, response: Response):
     if not pyotp.TOTP(current_otp_secret()).verify(req.otp_code, valid_window=1):
         raise HTTPException(status_code=403, detail="OTP 错误")
-    token = jwt.encode({"exp": time.time() + (30*86400 if req.remember_30d else 86400), "sub": "admin"}, JWT_SECRET, algorithm="HS256")
-    response.set_cookie(key="tg_device_token", value=token, max_age=30*86400, httponly=True, samesite="lax")
-    return {"status": "ok"}
+    now = time.time()
+    days = 30 if req.remember_30d else 1
+    ttl = days * 86400
+    exp = now + ttl
+    token = jwt.encode(
+        {"sub": "admin", "iat": now, "exp": exp, "days": days},
+        JWT_SECRET, algorithm="HS256"
+    )
+    # max_age 必须与 JWT 的 exp 一致：过去固定 30 天，选「仅 1 天」时浏览器会
+    # 继续携带一个早已失效的 cookie，表现成反复要求登录却清不掉。
+    response.set_cookie(
+        key="tg_device_token", value=token,
+        max_age=ttl, httponly=True, samesite="lax", path="/",
+    )
+    return {"status": "ok", "days": days, "expires_at": exp}
 
 @app.post("/api/logout")
 def logout(response: Response):
-    response.delete_cookie("tg_device_token")
+    response.delete_cookie("tg_device_token", path="/")
     return {"status": "ok"}
+
+@app.get("/api/security/session")
+def session_info(claims: dict = Depends(verify_auth)):
+    """当前设备的登录有效期。兼容早期签发、未带 days/iat 的旧 token。"""
+    exp = float(claims.get("exp", 0))
+    remain = max(0.0, exp - time.time())
+    if "days" in claims:
+        days = int(claims["days"])
+    else:
+        iat = float(claims.get("iat", 0))
+        days = round((exp - iat) / 86400) if iat else (30 if remain > 2 * 86400 else 1)
+    return {
+        "days": days,
+        "long_lived": days >= 30,
+        "expires_at": exp,
+        "remain_seconds": int(remain),
+        "remain_days": round(remain / 86400, 1),
+    }
 
 # ==================== 安全设置：动态口令换绑 ====================
 # 两阶段确认：先用当前口令证明身份 → 生成待确认密钥 → 用新口令确认后才落盘。
@@ -849,6 +922,7 @@ def get_config():
         "title": title_map.get(str(c.get("chat_id")), ""),
         "last_read_message_id": c.get("last_read_message_id", 0),
         "storage_id": c.get("_storage_id", ""),
+        "storage_path": c.get("_path", ""),
     } for c in cfg.get("chat", [])]
 
     storages_out = [{
@@ -940,6 +1014,9 @@ def save_config(payload: ConfigPayload):
         entry = {"chat_id": cid, "last_read_message_id": int(c.get("last_read_message_id", 0))}
         if sid:
             entry["_storage_id"] = sid
+        sub_path = clean_sub_path(c.get("storage_path", ""))
+        if sub_path:
+            entry["_path"] = sub_path
         clean_chats.append(entry)
         if c.get("title"):
             title_map[str(cid)] = c["title"]
@@ -968,6 +1045,31 @@ def save_config(payload: ConfigPayload):
     dump_config(cfg)
     link_engine_config(CONFIG_PATH)
     return {"status": "saved", "storages_count": len(clean_storages)}
+
+@app.get("/api/route_preview", dependencies=[Depends(verify_auth)])
+def route_preview():
+    """只读预览：按分组展示每个频道最终会存到哪里（不启动引擎）。"""
+    cfg = load_config()
+    storages, groups = build_groups(cfg)
+    storages_by_id = {s["id"]: s for s in cfg.get("_ui_storages", [])}
+    title_map = cfg.get("_ui_chat_titles", {})
+    base = cfg.get("save_path", "/app/save")
+    delete_after = cfg.get("_ui_delete_after_upload", False)
+    out = []
+    for (sid, sub), chats in groups.items():
+        storage = storages.get(sid)
+        upload = make_upload_drive(storage, delete_after, sub)
+        out.append({
+            "storage_id": sid,
+            "storage_name": storage.get("name", sid) if storage else "本地存储",
+            "sub_path": sub,
+            "save_path": f"{base}/{sub}" if sub else base,
+            "remote_dir": upload.get("remote_dir", ""),
+            "chats": [{"chat_id": c.get("chat_id"), "title": title_map.get(str(c.get("chat_id")), "")} for c in chats],
+            "lines": [describe_channel_target(c, title_map, storages_by_id, base) for c in chats],
+        })
+    return {"groups": out, "base_save_path": base}
+
 
 # ==================== 网盘测试 ====================
 
