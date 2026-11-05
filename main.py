@@ -533,9 +533,19 @@ def clean_chat_for_engine(c) -> dict:
 def strip_ui_keys(cfg) -> dict:
     return {k: v for k, v in cfg.items() if not k.startswith("_ui_")}
 
-def run_all_groups():
-    """按网盘分组串行运行下载引擎，实现真正的频道级存储路由"""
+def run_all_groups(auto: bool = False):
+    """按网盘分组串行运行下载引擎，实现真正的频道级存储路由。
+
+    auto=True 表示这轮是「容器启动后自动补一轮」，语义与手动点「▶ 启动」不同：
+    手动启动用户心里有数，自动启动不该替人做决定，所以水位线为 0（从没采过）
+    的频道会被跳过 —— 那种频道跑起来等于全量拉历史，可能几百 GB。
+    """
     global downloader_proc
+    started_at = time.time()
+    auto_skipped = 0
+    # 采集真正结束的时刻。不能用 finally 里的 time.time()：那之后还要发飞书/TG 通知，
+    # 一次通知可能耗十几秒，会把「耗时」算成两倍（实测 12.5s 采集被记成 25.8s）。
+    collect_finished_at = None
     try:
         cfg = load_config()
         storages, groups = build_groups(cfg)
@@ -552,6 +562,16 @@ def run_all_groups():
             if stop_event.is_set():
                 engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⏹ 收到停止信号，中止后续分组")
                 break
+
+            if auto:
+                # 自动启动只补增量：水位线 > 0 才说明这个频道采过，
+                # 引擎会用 offset_id=last_read_message_id 从它之后往新处取。
+                kept = [c for c in chats if int(c.get("last_read_message_id", 0) or 0) > 0]
+                if len(kept) != len(chats):
+                    auto_skipped += len(chats) - len(kept)
+                chats = kept
+                if not chats:
+                    continue
 
             label = storages[sid].get("name", sid) if sid else "本地存储"
             if sub_path:
@@ -627,6 +647,7 @@ def run_all_groups():
 
         elapsed = round(time.time() - session_stats["start_time"], 1)
         engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 🏁 全部任务结束 (耗时 {elapsed}s)")
+        collect_finished_at = time.time()
 
         # 任务完成通知
         notify_cfg = load_config().get("_ui_notify", {})
@@ -650,6 +671,27 @@ def run_all_groups():
     finally:
         downloader_proc = None
         link_engine_idle()
+        # 落盘「上次采集记录」。
+        # engine_logs 是内存 list，容器一重启就清空 —— 用户重启后既看不到刚才跑到
+        # 哪一组，也不知道为什么停了。把这一轮的起止时间、模式、结果写进 _ui_last_run，
+        # 面板重启后还能显示，这比只留一个水位线 ID 直观得多。
+        # read-modify-write 全程持 _yaml_lock，避免与其它请求的 dump_config 交叉覆盖。
+        try:
+            with _yaml_lock:
+                _cfg = load_config()
+                _end = collect_finished_at or time.time()
+                _cfg["_ui_last_run"] = {
+                    "at": int(started_at),
+                    "ended_at": int(_end),
+                    "elapsed": round(_end - float(session_stats.get("start_time") or started_at), 1),
+                    "downloaded": int(session_stats.get("downloaded_count", 0)),
+                    "mode": "auto" if auto else "manual",
+                    "skipped_no_watermark": auto_skipped,
+                    "ok": not stop_event.is_set(),
+                }
+                dump_config(_cfg)
+        except Exception as _exc:
+            print(f"[采集记录] 写入失败: {_exc}")
 
 # ==================== 通知 ====================
 
@@ -1378,6 +1420,9 @@ def get_config():
         "notify_on_task_finish": notify.get("notify_on_task_finish", True),
         "notify_on_each_file": notify.get("notify_on_each_file", False),
         "running": bool(engine_thread and engine_thread.is_alive()),
+        # 采集记录：容器重启后 engine_logs 会清空，这两项是跨重启保留的
+        "engine_autostart": bool(cfg.get("_ui_engine_autostart")),
+        "last_run": cfg.get("_ui_last_run") or {},
     }
 
 @app.post("/api/config", dependencies=[Depends(verify_auth)])
@@ -1961,19 +2006,31 @@ def test_notify_api():
 
 # ==================== 引擎控制 ====================
 
+def _start_engine(auto: bool = False) -> bool:
+    """启动一轮采集；已在跑就返回 False。
+
+    抽成函数是为了让「容器启动时自动补一轮」能复用同一套逻辑 ——
+    走的是完全相同的路径，自动模式不会绕开任何安全检查。
+    """
+    global engine_thread
+    if engine_thread is not None and engine_thread.is_alive():
+        return False
+    stop_event.clear()
+    engine_logs.clear()
+    session_stats["downloaded_count"] = 0
+    session_stats["start_time"] = time.time()
+    link_engine_idle()
+    engine_thread = threading.Thread(target=run_all_groups, args=(auto,), daemon=True)
+    engine_thread.start()
+    return True
+
+
 @app.post("/api/control/{action}", dependencies=[Depends(verify_auth)])
 def control_engine(action: str):
     global engine_thread
     sync_session_files()
     if action == "start":
-        if engine_thread is None or not engine_thread.is_alive():
-            stop_event.clear()
-            engine_logs.clear()
-            session_stats["downloaded_count"] = 0
-            session_stats["start_time"] = time.time()
-            link_engine_idle()
-            engine_thread = threading.Thread(target=run_all_groups, daemon=True)
-            engine_thread.start()
+        _start_engine(auto=False)
         return {"running": True}
     elif action == "stop":
         stop_event.set()
@@ -1986,22 +2043,72 @@ def control_engine(action: str):
             downloader_proc.terminate()
         if engine_thread and engine_thread.is_alive():
             engine_thread.join(timeout=8)
-        stop_event.clear()
-        engine_logs.clear()
-        session_stats["downloaded_count"] = 0
-        session_stats["start_time"] = time.time()
-        link_engine_idle()
-        engine_thread = threading.Thread(target=run_all_groups, daemon=True)
-        engine_thread.start()
-        return {"running": True}
+        # 旧线程若在 join 超时后仍活着，_start_engine 会拒绝再起一个 ——
+        # 原先这里是无条件新建线程，极端情况下会有两个 run_all_groups 并行跑。
+        _start_engine(auto=False)
+        return {"running": bool(engine_thread and engine_thread.is_alive())}
     raise HTTPException(status_code=400, detail="未知操作")
 
 @app.get("/api/logs", dependencies=[Depends(verify_auth)])
 def get_logs():
+    # 只读一次配置：这个接口会被前端每几秒轮询一次，重复读盘没必要
+    cfg = load_config()
     return {
         "running": bool(engine_thread and engine_thread.is_alive()),
         "logs": list(engine_logs), "stats": session_stats,
+        "last_run": cfg.get("_ui_last_run") or {},
+        "autostart": bool(cfg.get("_ui_engine_autostart")),
     }
+
+
+@app.post("/api/engine/autostart", dependencies=[Depends(verify_auth)])
+def set_engine_autostart(enabled: bool = False):
+    """开关「容器启动后自动补一轮增量」。"""
+    with _yaml_lock:
+        cfg = load_config()
+        cfg["_ui_engine_autostart"] = bool(enabled)
+        dump_config(cfg)
+    return {"ok": True, "autostart": bool(enabled)}
+
+
+@app.on_event("startup")
+def _autostart_engine_on_boot():
+    """容器 / NAS 重启后自动补一轮**增量**采集。
+
+    为什么是增量而不是重扫：引擎取消息用的是
+    `offset_id=last_read_message_id` + `reverse=True`，即从上次记录的水位线
+    往**更新**的方向取，之前采过的一律不再碰。水位线就是「采集记录」本身。
+    唯一会把水位线归零的是「一键采集历史」按钮，那是用户显式点的特殊操作，
+    自动启动走不到那条路。
+
+    水位线为 0（从没采过）的频道会被 run_all_groups(auto=True) 跳过 ——
+    那种频道跑起来等于全量拉历史，可能几百 GB，不该由重启替用户决定。
+    """
+    def _worker():
+        # 面板起来后 rclone、网盘凭据、session 文件还要几秒才就绪；
+        # 起太早会在第一组就报网络错误。
+        time.sleep(10)
+        try:
+            cfg = load_config()
+            if not cfg.get("_ui_engine_autostart"):
+                return
+            ready = [c for c in cfg.get("chat", [])
+                     if int(c.get("last_read_message_id", 0) or 0) > 0]
+            if not ready:
+                engine_logs.append(
+                    f"[{time.strftime('%H:%M:%S')}] ⚠ 自动采集已开启，但没有可增量补的频道"
+                    "（水位线都是 0，需先手动跑一次建立采集记录）"
+                )
+                return
+            sync_session_files()
+            if _start_engine(auto=True):
+                engine_logs.append(
+                    f"[{time.strftime('%H:%M:%S')}] 🚀 容器启动，自动补采增量：{len(ready)} 个频道"
+                )
+        except Exception as exc:
+            engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 自动采集启动失败：{exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 # ==================== 预览库：直接读网盘，不读容器本地 ====================
 # 引擎上传成功后默认会删掉本地文件（_ui_delete_after_upload），容器里本来就常年是空的；

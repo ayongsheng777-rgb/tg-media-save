@@ -179,6 +179,17 @@ body {
 .qb-src .meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .qb-src .path { font-size:11.5px; color:var(--ink-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
+/* 采集记录：五个小格子，窄屏自动折行（auto-fit 不需要写媒体查询） */
+.qb-run-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(104px,1fr)); gap:10px; margin-top:12px; }
+.qb-run-cell {
+  padding:10px 12px; border-radius:12px; background:rgba(255,255,255,.55);
+  border:1.5px solid rgba(255,255,255,.9); min-width:0;
+}
+.qb-run-cell .k { font-size:11px; color:var(--ink-soft); letter-spacing:.3px; margin-bottom:4px; }
+.qb-run-cell .v { font-size:14px; font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.qb-run-cell .v.ok { color:var(--muscat-green); }
+.qb-run-cell .v.warn { color:#c9803a; }
+
 .qb-lib-toolbar { display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin-top:14px; }
 .qb-chip {
   cursor:pointer; font:inherit; font-size:12.5px; padding:5px 12px; border-radius:999px;
@@ -839,6 +850,54 @@ body {
         <button @click="testNotify" class="qb-btn qb-btn-info">📨 发送测试通知</button>
         <button @click="saveConfig" class="qb-btn qb-btn-primary">💾 保存通知配置</button>
       </div>
+      <section class="qb-card accent-mint" id="engine-run-card">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>⚙️ 采集记录与自动补采</span>
+          <span class="qb-tag" :class="cfg.running ? 'qb-tag-ok' : 'qb-tag-info'">
+            {{ cfg.running ? '本轮进行中' : '空闲' }}
+          </span>
+        </div>
+
+        <div class="qb-run-grid" v-if="cfg.last_run && cfg.last_run.ended_at">
+          <div class="qb-run-cell">
+            <div class="k">上次采集</div>
+            <div class="v">{{ fmtRunTime(cfg.last_run.ended_at) }}</div>
+          </div>
+          <div class="qb-run-cell">
+            <div class="k">触发方式</div>
+            <div class="v">{{ cfg.last_run.mode === 'auto' ? '重启后自动' : '手动启动' }}</div>
+          </div>
+          <div class="qb-run-cell">
+            <div class="k">处理文件</div>
+            <div class="v">{{ cfg.last_run.downloaded || 0 }} 项</div>
+          </div>
+          <div class="qb-run-cell">
+            <div class="k">耗时</div>
+            <div class="v">{{ cfg.last_run.elapsed || 0 }} 秒</div>
+          </div>
+          <div class="qb-run-cell">
+            <div class="k">结果</div>
+            <div class="v" :class="cfg.last_run.ok ? 'ok' : 'warn'">
+              {{ cfg.last_run.ok ? '正常结束' : '被中断' }}
+            </div>
+          </div>
+        </div>
+        <div v-else class="qb-hint" style="margin-top:12px">
+          还没有采集记录。点顶部「▶ 启动」跑一轮，之后这里会留下时间、文件数和耗时 ——
+          这份记录落盘保存，容器重启也不会丢。
+        </div>
+
+        <label class="qb-check" style="margin-top:14px">
+          <input type="checkbox" v-model="cfg.engine_autostart" @change="toggleAutostart">
+          <span>容器 / NAS 重启后自动补一轮增量</span>
+        </label>
+        <div class="qb-hint" style="margin-top:6px">
+          只采「上次水位线之后」的新消息，采过的不会重扫（水位线就是采集记录本身）。
+          水位线为 0、从没采过的频道会被跳过 —— 那种频道跑起来等于全量拉历史，
+          需要你先手动跑一次建立记录。
+        </div>
+      </section>
+
       <section class="qb-card accent-berry">
         <div class="flex justify-between items-center mb-2"><span class="qb-card-title" style="margin-bottom:0">🖥️ 实时日志输出</span><button @click="fetchLogs" class="qb-btn qb-btn-soft qb-btn-sm">刷新</button></div>
         <div class="qb-log h-64 overflow-y-auto">
@@ -958,7 +1017,9 @@ createApp({
         file_path_prefix: ['chat_title', 'media_datetime'], media_types: ['photo', 'video'], chats: [], storages: [],
         proxy_enable: false, proxy_scheme: 'socks5', proxy_host: '127.0.0.1', proxy_port: 7890,
         proxy_user: '', proxy_pass: '', proxy_has_pass: false,
-        login_phone: ''
+        login_phone: '',
+        // 采集记录：容器重启后 engine_logs 清空，这两项落盘保留
+        engine_autostart: false, last_run: {}
       },
       tgStatus: { logged_in: false, authorized: false, phone: '', engine_busy: false, user: null, login_at: 0, checking: false },
       codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
@@ -1069,7 +1130,7 @@ createApp({
       const defaults = {
         chats: [], storages: [], proxy_enable: false, proxy_scheme: 'socks5',
         proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false,
-        login_phone: ''
+        login_phone: '', engine_autostart: false, last_run: {}
       };
       this.cfg = Object.assign({}, defaults, d);
       this.authed = true;
@@ -1566,7 +1627,34 @@ createApp({
       alert(d.message || d.detail || '测试完成');
     },
     async testNotify() { const r = await fetch('/api/test_notify', { method: 'POST' }); alert((await r.json()).msg); },
-    async fetchLogs() { const r = await fetch('/api/logs'); if(r.ok) { const d = await r.json(); this.logs = d.logs; this.cfg.running = d.running; } },
+    async fetchLogs() {
+      const r = await fetch('/api/logs');
+      if (r.ok) {
+        const d = await r.json();
+        this.logs = d.logs; this.cfg.running = d.running;
+        // 采集记录是落盘的，重启后仍在，顺手一并刷新
+        if (d.last_run) this.cfg.last_run = d.last_run;
+        if (typeof d.autostart === 'boolean') this.cfg.engine_autostart = d.autostart;
+      }
+    },
+    fmtRunTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    },
+    async toggleAutostart() {
+      const want = !!this.cfg.engine_autostart;
+      try {
+        const r = await fetch('/api/engine/autostart?enabled=' + want, { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+        this.cfg.engine_autostart = !!d.autostart;
+      } catch (e) {
+        // 回滚，别让界面显示一个根本没存下去的状态
+        this.cfg.engine_autostart = !want;
+        alert('保存自动补采开关失败：' + e.message);
+      }
+    },
     async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
 
     // ==================== 系统设置：OTP 换绑 ====================
