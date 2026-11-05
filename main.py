@@ -1,8 +1,8 @@
-import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets
+import os, re, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 import pyotp, jwt, httpx
 from ruamel.yaml import YAML
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
@@ -126,6 +126,69 @@ def link_engine_config(target: Path):
     if ENGINE_CONFIG_LINK.exists() or ENGINE_CONFIG_LINK.is_symlink():
         ENGINE_CONFIG_LINK.unlink()
     ENGINE_CONFIG_LINK.symlink_to(target)
+
+# ==================== 代理配置 ====================
+
+ALLOWED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
+
+class ProxyPayload(BaseModel):
+    enable: bool = False
+    scheme: str = "socks5"
+    host: str = "127.0.0.1"
+    port: int = 7890
+    user: str = ""
+    password: str = ""  # 留空表示沿用已保存的密码（前端不回显明文）
+
+def build_proxy_conf(payload: ProxyPayload, existing: Optional[dict] = None) -> Optional[dict]:
+    """校验并生成 Pyrogram 使用的 proxy dict；关闭代理时返回 None。"""
+    if not payload.enable:
+        return None
+    scheme = (payload.scheme or "socks5").strip().lower()
+    if scheme not in ALLOWED_PROXY_SCHEMES:
+        raise ValueError("不支持的代理协议，仅支持 socks5 / socks4 / http")
+    host = (payload.host or "").strip()
+    if not host:
+        raise ValueError("请填写代理主机地址")
+    try:
+        port = int(payload.port)
+    except (TypeError, ValueError):
+        raise ValueError("代理端口必须是数字")
+    if not (1 <= port <= 65535):
+        raise ValueError("代理端口需在 1–65535 之间")
+
+    user = (payload.user or "").strip()
+    password = (payload.password or "").strip()
+    old = existing or {}
+    if user and not password:
+        # 密码不回显到前端：留空表示沿用旧密码，但换用户名时必须重新填
+        if old.get("password") and old.get("username") == user:
+            password = old["password"]
+        elif old.get("password"):
+            raise ValueError("代理用户名已变更，请重新填写代理密码")
+    if password and not user:
+        raise ValueError("填写了代理密码就必须同时填写用户名")
+
+    conf = {"scheme": scheme, "hostname": host, "port": port}
+    if user:
+        conf["username"] = user
+        conf["password"] = password
+    return conf
+
+def apply_proxy(cfg, payload: ProxyPayload) -> Optional[dict]:
+    conf = build_proxy_conf(payload, cfg.get("proxy"))
+    if conf:
+        cfg["proxy"] = conf
+    elif "proxy" in cfg:
+        del cfg["proxy"]
+    return conf
+
+def proxy_to_url(conf: dict) -> str:
+    """httpx 用的代理 URL。用户名/密码必须百分号编码——sing-box 密码常含 @ : 等字符，
+    直接 f-string 拼接会被解析成 host 的一部分，导致代理握手失败。"""
+    auth = ""
+    if conf.get("username"):
+        auth = f"{quote(conf['username'], safe='')}:{quote(conf.get('password', ''), safe='')}@"
+    return f"{conf.get('scheme', 'socks5')}://{auth}{conf['hostname']}:{conf['port']}"
 
 # ==================== 多网盘管理 ====================
 
@@ -450,11 +513,7 @@ def send_notification(title: str, content_lines: List[str]) -> dict:
         token = notify["tgbot_token"].strip()
         chat_id = notify["tgbot_chat_id"].strip()
         proxy_cfg = cfg.get("proxy")
-        proxy_url = None
-        if proxy_cfg and proxy_cfg.get("hostname") and proxy_cfg.get("port"):
-            scheme = proxy_cfg.get("scheme", "socks5")
-            auth = f"{proxy_cfg['username']}:{proxy_cfg['password']}@" if proxy_cfg.get("username") else ""
-            proxy_url = f"{scheme}://{auth}{proxy_cfg['hostname']}:{proxy_cfg['port']}"
+        proxy_url = proxy_to_url(proxy_cfg) if proxy_cfg and proxy_cfg.get("hostname") and proxy_cfg.get("port") else None
         text_msg = f"🚀 *{title}*\n\n" + "\n".join(content_lines)
         try:
             with httpx.Client(proxy=proxy_url, timeout=12.0) as client:
@@ -592,22 +651,120 @@ class SendCodeReq(BaseModel):
     api_id: int
     api_hash: str
     phone: str
+    # 代理随请求一起提交并立即落盘：用户无需先点「保存全部配置」再发验证码
+    proxy: Optional[ProxyPayload] = None
 
 @app.post("/api/tg/send_code", dependencies=[Depends(verify_auth)])
 async def tg_send_code(req: SendCodeReq):
+    phone = (req.phone or "").strip()
+    api_hash = (req.api_hash or "").strip()
+    if not phone:
+        raise HTTPException(status_code=422, detail="请填写 Telegram 手机号（含国家代码，如 +8613800000000）")
+    if not api_hash:
+        raise HTTPException(status_code=422, detail="请先填写 API Hash")
+
     cfg = load_config()
-    cfg["api_id"], cfg["api_hash"] = req.api_id, req.api_hash.strip()
-    dump_config(cfg)
-    if pending_auth["client"]:
+    if req.proxy is not None:
         try:
-            await pending_auth["client"].disconnect()
+            apply_proxy(cfg, req.proxy)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    cfg["api_id"], cfg["api_hash"] = req.api_id, api_hash
+    dump_config(cfg)
+    link_engine_config(CONFIG_PATH)
+
+    # 清理上一次未完成的登录会话，避免残留连接占用代理
+    old = pending_auth.get("client")
+    if old:
+        try:
+            await old.disconnect()
         except Exception:
             pass
+    pending_auth.update({"client": None, "phone": None, "phone_code_hash": None})
+
     client = build_pyrogram_client()
-    await client.connect()
-    sent = await client.send_code(req.phone.strip())
-    pending_auth.update({"client": client, "phone": req.phone.strip(), "phone_code_hash": sent.phone_code_hash})
-    return {"ok": True, "msg": "验证码已发送"}
+    try:
+        await client.connect()
+        sent = await client.send_code(phone)
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        # Pyrogram 连不上 DC 时抛内置 ConnectionError(OSError)，过去会变成 500
+        # 且前端只弹「发送失败」，用户完全看不到原因——这里给出可操作的提示。
+        if isinstance(e, (ConnectionError, OSError, TimeoutError)):
+            detail = ("连不上 Telegram，通常是代理未配置或不可达。"
+                      "请在「🌐 代理设置」中填写代理并先点「测试连接」；"
+                      "容器内 127.0.0.1 指向容器自己，需填宿主机 IP 或 host.docker.internal。"
+                      f"（底层错误：{type(e).__name__}）")
+        else:
+            detail = f"Telegram 返回：{e}"
+        raise HTTPException(status_code=400, detail=detail) from e
+
+    pending_auth.update({"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash})
+    return {"ok": True, "msg": "验证码已发送，请在下方输入"}
+
+@app.post("/api/tg/proxy/test", dependencies=[Depends(verify_auth)])
+async def test_proxy(req: ProxyPayload):
+    """用与真实登录完全相同的 Pyrogram 链路验证代理，不碰账号、不发验证码、不触发风控。
+
+    不用 httpx + 外部 URL 探测：那样测的是「代理能否访问某个网站」，与 Telegram DC
+    链路并不等价，容易出现「测试说失败但 send_code 其实能用」的误判。
+    """
+    cfg = load_config()
+    try:
+        conf = build_proxy_conf(req, cfg.get("proxy"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not conf:
+        return {"ok": True, "direct": True, "msg": "未启用代理，将直连 Telegram（境内通常连不上）"}
+
+    def tcp_probe():
+        s = socket.create_connection((conf["hostname"], conf["port"]), timeout=5)
+        s.close()
+
+    try:
+        await asyncio.to_thread(tcp_probe)
+    except OSError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"代理端口不可达 {conf['hostname']}:{conf['port']}：{e}。容器内请填宿主机 IP，不要填 127.0.0.1"
+        )
+
+    probe = Client(
+        name="_proxy_probe",
+        api_id=int(cfg.get("api_id") or 123456),
+        api_hash=str(cfg.get("api_hash") or ""),
+        workdir="/tmp",
+        in_memory=True,   # 不写 session 文件，避免污染登录态
+        proxy=conf,
+    )
+    try:
+        await asyncio.wait_for(probe.connect(), timeout=20)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"代理端口通，但连不上 Telegram：{type(e).__name__}: {e}。请检查协议、账号密码与分流规则"
+        )
+    finally:
+        try:
+            await probe.disconnect()
+        except Exception:
+            pass
+    return {"ok": True, "msg": f"代理可用，已成功连上 Telegram DC（{conf['scheme']}://{conf['hostname']}:{conf['port']}）"}
+
+@app.post("/api/tg/auth/cancel", dependencies=[Depends(verify_auth)])
+async def tg_auth_cancel():
+    """放弃当前登录会话，允许重新发送验证码。"""
+    client = pending_auth.get("client")
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    pending_auth.update({"client": None, "phone": None, "phone_code_hash": None})
+    return {"status": "ok"}
 
 class VerifyCodeReq(BaseModel):
     code: str = ""
@@ -712,7 +869,9 @@ def get_config():
         "media_types": cfg.get("media_types", ["photo", "video"]),
         "proxy_enable": bool(proxy), "proxy_scheme": proxy.get("scheme", "socks5"),
         "proxy_host": proxy.get("hostname", "127.0.0.1"), "proxy_port": proxy.get("port", 7890),
-        "proxy_user": proxy.get("username", ""), "proxy_pass": proxy.get("password", ""),
+        "proxy_user": proxy.get("username", ""),
+        # 代理密码不回显到浏览器；留空提交表示沿用已保存的密码
+        "proxy_pass": "", "proxy_has_pass": bool(proxy.get("password")),
         "chats": chats_out, "storages": storages_out,
         "delete_after_upload": cfg.get("_ui_delete_after_upload", False),
         "feishu_enable": notify.get("feishu_enable", False), "feishu_webhook": notify.get("feishu_webhook", ""),
@@ -786,15 +945,15 @@ def save_config(payload: ConfigPayload):
             title_map[str(cid)] = c["title"]
     cfg["chat"], cfg["_ui_chat_titles"] = clean_chats, title_map
 
-    # --- 代理 ---
-    if payload.proxy_enable:
-        cfg["proxy"] = {
-            "scheme": payload.proxy_scheme, "hostname": payload.proxy_host,
-            "port": int(payload.proxy_port),
-            **({"username": payload.proxy_user, "password": payload.proxy_pass} if payload.proxy_user else {})
-        }
-    elif "proxy" in cfg:
-        del cfg["proxy"]
+    # --- 代理（统一走 build_proxy_conf：校验协议/端口、密码留空保持不变）---
+    try:
+        apply_proxy(cfg, ProxyPayload(
+            enable=payload.proxy_enable, scheme=payload.proxy_scheme,
+            host=payload.proxy_host, port=payload.proxy_port,
+            user=payload.proxy_user, password=payload.proxy_pass,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # 引擎运行时的 upload_drive 由分组逻辑按组动态生成，这里只留一个静态兜底
     cfg["upload_drive"] = {"enable_upload_file": False}
