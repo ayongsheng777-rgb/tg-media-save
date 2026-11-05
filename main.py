@@ -19,6 +19,8 @@ yaml.preserve_quotes = True
 
 CONFIG_PATH = Path("/app/config_store/config.yaml")
 ENGINE_CONFIG_LINK = Path("/app/config.yaml")
+# 引擎空闲时的配置副本：绝不让引擎的写盘碰到 CONFIG_PATH 本身
+ENGINE_IDLE_CONFIG = Path("/app/config_store/_engine_idle.yaml")
 SESSION_STORE_DIR = Path("/app/sessions")
 SESSION_NAME = "media_downloader"
 RCLONE_CONF_PATH = Path("/root/.config/rclone/rclone.conf")
@@ -108,9 +110,24 @@ def init_env():
         }
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             yaml.dump(default_cfg, f)
+    # /app/config.yaml 绝不能指向主配置本身。
+    # 引擎退出时用 open(config_file, "w") 回写水位线，这个写法会**穿透符号链接**，
+    # 一旦链接指向 config_store/config.yaml，_ui_*（网盘、登录态、频道标题、
+    # 飞书通知…）就会被整段冲掉、水位线还会被打回 0。
+    # 这里只指向一份「去掉 _ui_* 的副本」；此处是模块导入期，link_engine_idle()
+    # 还没定义，所以内联同样的逻辑。
+    try:
+        if not ENGINE_IDLE_CONFIG.exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                _boot_cfg = yaml.load(f) or {}
+            with open(ENGINE_IDLE_CONFIG, "w", encoding="utf-8") as f:
+                yaml.dump({k: v for k, v in _boot_cfg.items()
+                           if not str(k).startswith("_ui_")}, f)
+    except Exception as _exc:
+        print(f"[引擎配置] 初始化空闲副本失败: {_exc}")
     if ENGINE_CONFIG_LINK.exists() or ENGINE_CONFIG_LINK.is_symlink():
         ENGINE_CONFIG_LINK.unlink()
-    ENGINE_CONFIG_LINK.symlink_to(CONFIG_PATH)
+    ENGINE_CONFIG_LINK.symlink_to(ENGINE_IDLE_CONFIG)
 
 init_env()
 # 安全：不在容器日志中输出 OTP 密钥 / provisioning URI（见设计文档 §2）
@@ -154,7 +171,19 @@ def dump_config(cfg):
 
     之前是「open(w) 直接写」，写入期间并发读会拿到半截 YAML，
     ruamel 解析直接抛 IndexError，表现为接口 500。
+
+    另外加一道保险：盘上配置带 _ui_*（网盘/登录态/通知…）而待写的完全不带时，
+    说明拿错了对象（引擎格式的配置），拒绝覆盖 —— 这类覆盖会静默丢掉整段设置。
     """
+    if cfg and not any(k.startswith("_ui_") for k in cfg):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                on_disk = yaml.load(f) or {}
+            if any(k.startswith("_ui_") for k in on_disk):
+                print("[配置] 拒绝写入：待写配置不含 _ui_*，会覆盖掉网盘/登录态/通知设置")
+                return
+        except Exception:
+            pass
     tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f)
@@ -167,6 +196,32 @@ def link_engine_config(target: Path):
     if ENGINE_CONFIG_LINK.exists() or ENGINE_CONFIG_LINK.is_symlink():
         ENGINE_CONFIG_LINK.unlink()
     ENGINE_CONFIG_LINK.symlink_to(target)
+
+
+def link_engine_idle():
+    """引擎空闲时把 /app/config.yaml 指向一份主配置副本，而不是主配置本身。
+
+    引擎退出时用 open(config_file, "w") 回写水位线，这个写法会**穿透符号链接**。
+    只要链接曾经指向 config_store/config.yaml，引擎的回写就会把 _ui_*（网盘、
+    登录态、频道标题、飞书通知…）整段冲掉，水位线还会被打回 0。
+    所以链接一律只指向副本或分组配置，主配置永远不经引擎之手。
+    """
+    try:
+        data = strip_ui_keys(load_config())
+    except Exception as exc:
+        print(f"[引擎配置] 生成空闲副本失败: {exc}")
+        return
+    try:
+        itmp = ENGINE_IDLE_CONFIG.with_suffix(".yaml.tmp")
+        with open(itmp, "w", encoding="utf-8") as f:
+            yaml.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(itmp, ENGINE_IDLE_CONFIG)
+    except Exception as exc:
+        print(f"[引擎配置] 写空闲副本失败: {exc}")
+        return
+    link_engine_config(ENGINE_IDLE_CONFIG)
 
 # ==================== 代理配置 ====================
 
@@ -512,15 +567,25 @@ def run_all_groups():
                     session_stats["downloaded_count"] += 1
             proc.wait()
 
-            # 回写本组频道的水位线到主配置
+            # 回写本组频道的水位线到主配置。
+            # 以「链接此刻实际指向哪里」为准：引擎可能就地改写它读到的那份配置，
+            # 也可能把符号链接换成了普通文件，只认 tmp 会读到旧值（水位线被打回 0）。
             try:
-                with open(tmp, "r", encoding="utf-8") as f:
+                src = tmp
+                try:
+                    resolved = ENGINE_CONFIG_LINK.resolve()
+                    if resolved.exists():
+                        src = resolved
+                except Exception:
+                    pass
+                with open(src, "r", encoding="utf-8") as f:
                     updated = yaml.load(f) or {}
-                id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0)) for u in updated.get("chat", [])}
+                id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0) or 0)
+                          for u in updated.get("chat", [])}
                 main_cfg = load_config()
                 for c in main_cfg.get("chat", []):
                     key = str(c.get("chat_id"))
-                    if key in id_map:
+                    if key in id_map and id_map[key] > int(c.get("last_read_message_id", 0) or 0):
                         c["last_read_message_id"] = id_map[key]
                 dump_config(main_cfg)
             except Exception as e:
@@ -535,7 +600,7 @@ def run_all_groups():
             engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ [{idx+1}/{total}] {label} 完成")
 
         # 恢复引擎 config 指向主配置
-        link_engine_config(CONFIG_PATH)
+        link_engine_idle()
 
         elapsed = round(time.time() - session_stats["start_time"], 1)
         engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 🏁 全部任务结束 (耗时 {elapsed}s)")
@@ -561,7 +626,7 @@ def run_all_groups():
             )
     finally:
         downloader_proc = None
-        link_engine_config(CONFIG_PATH)
+        link_engine_idle()
 
 # ==================== 通知 ====================
 
@@ -759,7 +824,7 @@ def update_login_state(**kwargs) -> dict:
     state.update(kwargs)
     cfg["_ui_login"] = state
     dump_config(cfg)
-    link_engine_config(CONFIG_PATH)
+    link_engine_idle()
     return state
 
 _tg_status_cache = {"at": 0.0, "data": None}
@@ -849,7 +914,7 @@ async def tg_send_code(req: SendCodeReq):
     login_state["phone"] = phone
     cfg["_ui_login"] = login_state
     dump_config(cfg)
-    link_engine_config(CONFIG_PATH)
+    link_engine_idle()
 
     # 清理上一次未完成的登录会话，避免残留连接占用代理
     old = pending_auth.get("client")
@@ -1084,7 +1149,7 @@ async def tg_collect(req: CollectReq):
     cfg["chat"] = deduped
     cfg["_ui_chat_titles"] = titles
     dump_config(cfg)
-    link_engine_config(CONFIG_PATH)
+    link_engine_idle()
 
     if req.start_engine:
         control_engine("start")
@@ -1195,7 +1260,7 @@ def collect_history(req: CollectHistoryReq):
             engine_thread.join(timeout=20)
 
     dump_config(cfg)
-    link_engine_config(CONFIG_PATH)
+    link_engine_idle()
 
     started = False
     if req.start_engine:
@@ -1390,7 +1455,7 @@ def save_config(payload: ConfigPayload):
         "notify_on_each_file": payload.notify_on_each_file,
     }
     dump_config(cfg)
-    link_engine_config(CONFIG_PATH)
+    link_engine_idle()
     return {"status": "saved", "storages_count": len(clean_storages)}
 
 @app.get("/api/route_preview", dependencies=[Depends(verify_auth)])
@@ -1504,7 +1569,7 @@ def control_engine(action: str):
             engine_logs.clear()
             session_stats["downloaded_count"] = 0
             session_stats["start_time"] = time.time()
-            link_engine_config(CONFIG_PATH)
+            link_engine_idle()
             engine_thread = threading.Thread(target=run_all_groups, daemon=True)
             engine_thread.start()
         return {"running": True}
@@ -1523,7 +1588,7 @@ def control_engine(action: str):
         engine_logs.clear()
         session_stats["downloaded_count"] = 0
         session_stats["start_time"] = time.time()
-        link_engine_config(CONFIG_PATH)
+        link_engine_idle()
         engine_thread = threading.Thread(target=run_all_groups, daemon=True)
         engine_thread.start()
         return {"running": True}
@@ -1543,7 +1608,7 @@ def get_logs():
 
 LIB_SERVE_HOST = "127.0.0.1"
 LIB_SERVE_BASE_PORT = 8901          # 每个存储一个只读 serve，端口按存储顺序递增
-LIB_LIST_TTL = 90                   # 目录列举缓存（秒）
+LIB_LIST_TTL = 180                  # 目录列举缓存（秒）；lsjson 递归列举 2000+ 文件约 7–11 秒
 LIB_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic"}
 LIB_VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".flv"}
 LIB_MEDIA_EXT = LIB_IMAGE_EXT | LIB_VIDEO_EXT
@@ -1734,7 +1799,8 @@ async def library_raw(sid: str, path: str, request: Request):
     cfg = load_config()
     st = _lib_storage(sid, cfg)
     rel = _safe_rel(path)
-    port = ensure_lib_server(sid)
+    # ensure_lib_server 会阻塞（首次要等进程起监听），别在事件循环里等
+    port = await asyncio.to_thread(ensure_lib_server, sid)
     # serve 挂在 remote 根上，而 lsjson 返回的 Path 是相对 remote_dir 的，这里要补回前缀
     base = (st.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
     url = f"http://{LIB_SERVE_HOST}:{port}/" + quote(f"{base}/{rel}")

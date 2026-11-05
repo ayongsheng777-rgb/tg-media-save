@@ -799,6 +799,12 @@ body {
 
         <div v-if="lib.err" class="qb-alert warn" style="margin-top:12px">{{ lib.err }}</div>
 
+        <div v-else-if="lib.loading && !lib.items.length" class="qb-alert" style="margin-top:12px">
+          <div class="qb-alert-title">正在列举网盘目录…</div>
+          <div>首次进入要递归扫一遍远端目录（几千个文件约 10 秒），之后 3 分钟内走缓存。
+            需要最新数据点「🔄 刷新」。</div>
+        </div>
+
         <div v-else-if="!lib.loading && !lib.items.length" class="qb-hint" style="margin-top:16px">
           这个网盘目录下还没有媒体文件。可能是频道还没采集完，或远程目录填错了。
         </div>
