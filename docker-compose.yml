@@ -41,8 +41,19 @@ services:
         TGFS_BASE: ${TGFS_IMAGE:-docker.1ms.run/wheatcarrier/tgfs:latest}
     image: tg-pro-tgfs:local
     container_name: tgfs
-    # 首次还没有 config.yaml 时会立刻退出，等面板保存配置后再拉起，所以不用 unless-stopped
-    restart: "no"
+    # 没有 config.yaml 时官方镜像会直接退出（FileNotFoundError），如果配 unless-stopped
+    # 就会变成无限重启循环。所以先用一个等待循环占住，等面板写好配置再 exec 真正的入口；
+    # 这样既不会空转重启，NAS 重启后也能自动恢复。
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        while [ ! -f /data/config.yaml ]; do
+          echo "$$(date '+%F %T') 等待面板生成 /data/config.yaml …"
+          sleep 30
+        done
+        exec python main.py
     network_mode: host
     volumes:
       - ./tgfs_data:/data

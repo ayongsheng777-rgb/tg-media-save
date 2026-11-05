@@ -1005,10 +1005,11 @@ createApp({
     },
     tgfsTagText() {
       const t = this.tgfs;
-      if (!t.conf_exists && !t.configured) return '未配置';
       const c = t.container || {};
-      if (!t.docker_ok) return '已配置 · 无法控制容器';
+      if (!t.docker_ok) return t.conf_exists ? '已配置 · 无法控制容器' : '未配置';
       if (c.status === 'not-created') return '已配置 · 容器未创建';
+      // 容器可能正在等待配置文件（compose 里的等待循环），这时别误报成"未就绪"
+      if (!t.conf_exists) return c.running ? '等待填写配置' : '未配置';
       if (!c.running) return '已停止';
       const w = t.webdav || {};
       if (w.ok) return '运行中 · WebDAV 可用';
@@ -1017,7 +1018,7 @@ createApp({
     tgfsTagClass() {
       const t = this.tgfs;
       const c = t.container || {};
-      if (!t.conf_exists && !t.configured) return 'qb-tag-warn';
+      if (!t.conf_exists) return 'qb-tag-warn';
       if (c.running && (t.webdav || {}).ok) return 'qb-tag-ok';
       if (c.running) return 'qb-tag-info';
       return 'qb-tag-warn';
