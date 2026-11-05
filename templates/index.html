@@ -292,6 +292,12 @@ body {
           <div>把所选频道的采集水位线归零，引擎会从每个频道<b>最旧的消息</b>一路采到最新，
             并按该频道绑定的网盘上传。已经传过的旧文件会重新下载并再传一次。</div>
         </div>
+        <div class="qb-alert" style="margin-top:10px">
+          <div class="qb-alert-title">先扫历史，再下载</div>
+          <div>引擎要先把频道历史<b>从头扫一遍</b>才能找到媒体，期间日志会显示
+            <code>[枚举] 已扫描 N 条</code>。纯文字消息占比高的频道，可能要扫上万条、几分钟后
+            才出现第一个文件，属正常现象，不是卡死。</div>
+        </div>
         <div class="qb-list-pick qb-history-list" style="margin-top:12px">
           <label v-for="c in boundChats" :key="c.chat_id" class="qb-pick">
             <input type="checkbox" :value="c.chat_id" v-model="history.selected">

@@ -17,6 +17,16 @@ RUN pip install --no-cache-dir --timeout 60 \
     aiofiles \
     "httpx[socks]"
 
+# 覆盖引擎的两个文件（见 patch/ 下各文件头说明）：
+#   get_chat_history_v2.py  去掉走到历史末尾时把整段历史再解析一遍的兜底分支，
+#                          并每扫描 500 条打印一行进度（否则枚举期间界面完全无反馈）
+#   media_downloader.py    无媒体的消息不再进下载队列（否则 worker 先空转上万次）
+# 升级基础镜像时需比对上游 md5：
+#   get_chat_history_v2.py  9a5a71be726fa2f17084b4ca475110af（98 行）
+#   media_downloader.py     4423473362625e569bae39bcc5de70ed（704 行）
+COPY patch/get_chat_history_v2.py /app/module/get_chat_history_v2.py
+COPY patch/media_downloader.py /app/media_downloader.py
+
 COPY main.py /app/panel_main.py
 COPY templates /app/templates
 
