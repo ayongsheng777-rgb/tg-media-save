@@ -279,25 +279,66 @@ body {
         </div>
       </section>
 
-      <!-- 一键采集新频道：批量加入监控队列，并可补齐历史 -->
+      <!-- 一键采集历史：把已绑定网盘频道的采集水位线归零，重采全部历史并上传 -->
+      <section class="qb-card accent-peach">
+        <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
+          <span>🧲 一键采集历史并上传</span>
+          <span class="qb-tag" :class="boundChats.length ? 'qb-tag-ok' : 'qb-tag-warn'">
+            已绑定网盘 {{ boundChats.length }} 个频道
+          </span>
+        </div>
+        <div class="qb-alert" style="margin-top:10px">
+          <div class="qb-alert-title">这个按钮做什么</div>
+          <div>把所选频道的采集水位线归零，引擎会从每个频道<b>最旧的消息</b>一路采到最新，
+            并按该频道绑定的网盘上传。已经传过的旧文件会重新下载并再传一次。</div>
+        </div>
+        <div class="qb-list-pick qb-history-list" style="margin-top:12px">
+          <label v-for="c in boundChats" :key="c.chat_id" class="qb-pick">
+            <input type="checkbox" :value="c.chat_id" v-model="history.selected">
+            <span class="t">{{ c.title || c.chat_id }}</span>
+            <span class="qb-tag qb-tag-info" style="flex:none">{{ storageName(c.storage_id) }}</span>
+            <span class="qb-hint" style="flex:none">{{ c.last_read_message_id > 0 ? '已采到 ' + c.last_read_message_id : '未采集' }}</span>
+          </label>
+          <div v-if="!boundChats.length" class="qb-hint" style="text-align:center;padding:16px 0">
+            监控队列里还没有绑定网盘的频道 —— 先在下方「监控队列」给频道选一个存储目标
+          </div>
+        </div>
+        <div class="qb-hint" style="margin-top:8px" v-if="history.selected.length">
+          落盘位置：<code>{{ historySelectedPreview() }}</code>
+        </div>
+        <div class="flex gap-2 items-center flex-wrap" style="margin-top:12px">
+          <button @click="runHistoryCollect" :disabled="historyBusy || !history.selected.length" class="qb-btn qb-btn-primary">
+            ⚡ 一键采集并上传 {{ history.selected.length }} 个频道
+          </button>
+          <button @click="selectAllBound" class="qb-btn qb-btn-soft qb-btn-sm">全选</button>
+          <button @click="selectUncollected" class="qb-btn qb-btn-soft qb-btn-sm">仅选未采集</button>
+          <button @click="clearBound" class="qb-btn qb-btn-soft qb-btn-sm">清空</button>
+          <span v-if="historyBusy" class="qb-hint">处理中，请稍候…</span>
+        </div>
+        <div class="flex flex-wrap gap-4" style="margin-top:10px">
+          <label class="qb-check" style="margin-bottom:0"><input type="checkbox" v-model="history.reset_watermark"> 归零水位线（重采全部历史）</label>
+          <label class="qb-check" style="margin-bottom:0"><input type="checkbox" v-model="history.start_engine"> 立即启动引擎</label>
+        </div>
+        <div v-if="history.reset_watermark" class="qb-alert warn qb-panel-note">
+          <div>全量重采会占用大量带宽与网盘空间，历史量大的频道可能跑很久。只想补新消息就取消勾选「归零水位线」。</div>
+        </div>
+        <div v-if="historyMsg" class="qb-msg" :class="historyMsgOk ? 'ok' : 'err'">{{ historyMsg }}</div>
+      </section>
+
+      <!-- 从账号批量添加频道：只建队列，不采历史 -->
       <div v-if="scanOpen" class="qb-panel qb-scan-panel">
         <div class="qb-panel-head">
           <div>
             <div class="qb-panel-title">
-              🧲 一键采集新频道
-              <span class="qb-tag qb-tag-warn">发现 {{ newDialogs.length }} 个未添加</span>
+              ➕ 从账号批量添加频道
+              <span class="qb-tag qb-tag-info">发现 {{ newDialogs.length }} 个未添加</span>
             </div>
-            <div class="qb-hint" style="margin-top:4px">已在监控队列里的频道会自动跳过，不会重复添加。</div>
+            <div class="qb-hint" style="margin-top:4px">这一步只把频道加进监控队列，不会立刻下载。加完回到上方「一键采集历史并上传」开始补历史。</div>
           </div>
           <button @click="scanOpen = false" class="qb-btn qb-btn-soft qb-btn-sm">收起</button>
         </div>
         <div class="qb-panel-body">
-          <div class="qb-alert warn qb-panel-note">
-            <div class="qb-alert-title">起始 ID 决定要不要补历史</div>
-            <div>填 <b>0</b> 表示水位线归零，引擎会从该频道<b>最旧的历史消息</b>一路采到最新（历史量大时耗时长）；
-            填具体 ID 则只采集该 ID 之后的新消息。</div>
-          </div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-3" style="margin-top:12px">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div>
               <label class="qb-field-label">新频道存储目标</label>
               <select v-model="collect.storage_id" class="qb-input">
@@ -310,11 +351,10 @@ body {
               <input v-model="collect.storage_path" placeholder="如 科技/2026" class="qb-input">
             </div>
             <div>
-              <label class="qb-field-label">起始 ID（0 = 全部历史）</label>
+              <label class="qb-field-label">起始 ID（0 = 待补全部历史）</label>
               <input type="number" v-model.number="collect.start_id" placeholder="0" class="qb-input">
             </div>
           </div>
-          <label class="qb-check" style="margin-top:12px"><input type="checkbox" v-model="collect.start_engine"> 采集完成后立即启动引擎</label>
           <div class="qb-alert qb-panel-note">
             <div>默认只勾选<b>频道</b>类型：群组的历史消息量通常极大，全量补采可能长时间占满带宽与网盘，确认需要再手动勾选。</div>
           </div>
@@ -327,11 +367,11 @@ body {
             <div v-if="!newDialogs.length" class="qb-hint" style="text-align:center;padding:14px 0">没有新的频道了 —— 已添加的频道会自动去重</div>
           </div>
           <div class="flex gap-2 items-center flex-wrap" style="margin-top:12px">
-            <button @click="collectAllNew" :disabled="collectBusy || !collect.selected.length" class="qb-btn qb-btn-primary">⚡ 一键采集 {{ collect.selected.length }} 个频道</button>
+            <button @click="collectAllNew" :disabled="collectBusy || !collect.selected.length" class="qb-btn qb-btn-primary">➕ 加入监控队列 {{ collect.selected.length }} 个</button>
             <button @click="selectChannelsOnly" class="qb-btn qb-btn-soft qb-btn-sm">仅选频道</button>
             <button @click="selectAllNew" class="qb-btn qb-btn-soft qb-btn-sm">全选（含群组）</button>
             <button @click="selectNone" class="qb-btn qb-btn-soft qb-btn-sm">清空</button>
-            <span v-if="collectBusy" class="qb-hint">采集中，请稍候…</span>
+            <span v-if="collectBusy" class="qb-hint">处理中，请稍候…</span>
           </div>
           <div v-if="collectMsg" class="qb-msg" :class="collectMsgOk ? 'ok' : 'err'">{{ collectMsg }}</div>
         </div>
@@ -703,7 +743,9 @@ createApp({
       proxyBusy: false, proxyMsg: '', proxyMsgOk: true,
       tgBusy: false, tgMsg: '', tgMsgOk: true,
       scanOpen: false, collectBusy: false, collectMsg: '', collectMsgOk: true,
-      collect: { selected: [], storage_id: '', storage_path: '', start_id: 0, start_engine: false },
+      collect: { selected: [], storage_id: '', storage_path: '', start_id: 0 },
+      historyBusy: false, historyMsg: '', historyMsgOk: true,
+      history: { selected: [], reset_watermark: true, start_engine: true },
       dialogs: [], dialogSearch: '', logs: [], mediaList: [],
       // OTP 换绑状态
       otp: { source: 'env', step: 1, resetOpen: false },
@@ -719,6 +761,11 @@ createApp({
     },
     newDialogs() {
       return this.dialogs.filter(d => !d.added);
+    },
+    // 已绑定网盘的频道 = 一键采集历史的作用对象
+    boundChats() {
+      const ids = new Set((this.cfg.storages || []).map(s => s.id));
+      return (this.cfg.chats || []).filter(c => c.storage_id && ids.has(c.storage_id));
     }
   },
   mounted() { this.fetchConfig(); setInterval(() => { if(this.authed && this.tab==='notify') this.fetchLogs(); }, 3000); },
@@ -768,6 +815,12 @@ createApp({
       };
       this.cfg = Object.assign({}, defaults, d);
       this.authed = true;
+      // 默认全选「已绑定网盘」的频道；刷新时保留已有选择，但剔除已解绑的
+      const boundIds = new Set((this.cfg.storages || []).map(s => s.id));
+      const boundChatIds = (this.cfg.chats || [])
+        .filter(c => c.storage_id && boundIds.has(c.storage_id)).map(c => c.chat_id);
+      const kept = (this.history.selected || []).filter(id => boundChatIds.includes(id));
+      this.history.selected = kept.length ? kept : boundChatIds;
       this.fetchSession();
       this.fetchTgStatus();
     },
@@ -906,6 +959,53 @@ createApp({
     selectNone() {
       this.collect.selected = [];
     },
+    // ==================== 一键采集历史（已绑定网盘的频道）====================
+    setHistoryMsg(text, ok) { this.historyMsg = text; this.historyMsgOk = !!ok; },
+    selectAllBound() { this.history.selected = this.boundChats.map(c => c.chat_id); },
+    selectUncollected() {
+      this.history.selected = this.boundChats
+        .filter(c => !(Number(c.last_read_message_id) > 0)).map(c => c.chat_id);
+    },
+    clearBound() { this.history.selected = []; },
+    historySelectedPreview() {
+      const lines = [];
+      this.boundChats
+        .filter(c => this.history.selected.includes(c.chat_id))
+        .forEach(c => {
+          const line = this.storageName(c.storage_id) + ' → ' + this.channelPathPreview(c);
+          if (!lines.includes(line)) lines.push(line);
+        });
+      if (!lines.length) return '—';
+      return lines.length > 2 ? lines.slice(0, 2).join('；') + ' 等 ' + lines.length + ' 处' : lines.join('；');
+    },
+    async runHistoryCollect() {
+      if (!this.history.selected.length) return;
+      this.historyBusy = true; this.historyMsg = '';
+      try {
+        const res = await fetch('/api/collect/history', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            chat_ids: this.history.selected.map(Number),
+            reset_watermark: !!this.history.reset_watermark,
+            start_engine: !!this.history.start_engine
+          })
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.setHistoryMsg(d.detail || '采集失败', false);
+        } else {
+          let msg = `已提交 ${d.total} 个频道（${d.mode}）`;
+          if (d.was_running) msg += '；已先停掉正在运行的引擎，避免水位线被旧值覆盖';
+          msg += d.engine_started ? '；引擎已启动，进度见「通知与日志」' : '；引擎未启动，可点顶部「▶ 启动」';
+          if ((d.skipped || []).length) msg += `；跳过 ${d.skipped.length} 个未绑定网盘的频道`;
+          this.setHistoryMsg(msg, true);
+          await this.fetchConfig();
+        }
+      } catch (e) {
+        this.setHistoryMsg('请求失败：' + e, false);
+      }
+      this.historyBusy = false;
+    },
     async collectAllNew() {
       this.collectBusy = true; this.collectMsg = '';
       try {
@@ -916,7 +1016,8 @@ createApp({
             storage_id: this.collect.storage_id || '',
             storage_path: this.collect.storage_path || '',
             start_id: Number(this.collect.start_id) || 0,
-            start_engine: !!this.collect.start_engine
+            // 加队列不启动引擎：补历史交给上方「一键采集历史并上传」
+            start_engine: false
           })
         });
         const d = await res.json().catch(() => ({}));
@@ -925,11 +1026,11 @@ createApp({
         } else {
           const skipped = (d.skipped || []).length;
           const dedup = d.dedup_removed || 0;
-          let msg = `新增 ${(d.added || []).length} 个频道`;
+          let msg = `已加入监控队列 ${(d.added || []).length} 个频道`;
           if (skipped) msg += `，跳过重复 ${skipped} 个`;
           if ((d.not_found || []).length) msg += `，未在 TG 中找到 ${d.not_found.length} 个`;
           if (dedup) msg += `，清理重复记录 ${dedup} 条`;
-          if (Number(d.start_id) === 0) msg += '；起始 ID = 0，将补齐这些频道的全部历史媒体';
+          msg += '。下一步：回到上方「一键采集历史并上传」开始补历史。';
           this.setCollectMsg(msg, true);
           this.collect.selected = [];
           await this.fetchConfig();

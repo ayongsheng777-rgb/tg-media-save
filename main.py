@@ -1093,6 +1093,124 @@ async def tg_collect(req: CollectReq):
         "start_id": int(req.start_id),
     }
 
+# ==================== 一键采集历史（已绑定网盘的频道）====================
+# 语义：把「监控队列里已绑定网盘」的频道的 last_read_message_id 归零，让引擎的
+# offset_id 退化为 1，从该频道最旧的消息一路采到最新，并按频道绑定的网盘上传。
+# 与「从账号批量添加频道」是两件事：前者采历史并上传，后者只是把频道建进队列。
+
+class CollectHistoryReq(BaseModel):
+    chat_ids: List[int] = []        # 空 = 全部已绑定网盘的频道
+    reset_watermark: bool = True    # True: 归零重采全部历史；False: 只补水位线之后的增量
+    start_engine: bool = True
+    dry_run: bool = False
+
+def _describe_bound_channels(cfg) -> dict:
+    """把队列里的频道分成「已绑定网盘」和「未绑定」两类，并算出各自的落盘位置。"""
+    storages_by_id = {s["id"]: s for s in cfg.get("_ui_storages", [])}
+    title_map = cfg.get("_ui_chat_titles", {})
+    base = cfg.get("save_path", "/app/save")
+    bound, unbound = [], []
+    for c in cfg.get("chat", []):
+        cid = c.get("chat_id")
+        title = title_map.get(str(cid), str(cid))
+        sid = c.get("_storage_id", "")
+        storage = storages_by_id.get(sid)
+        sub = clean_sub_path(c.get("_path", ""))
+        wm = int(c.get("last_read_message_id", 0) or 0)
+        item = {
+            "chat_id": cid,
+            "title": title,
+            "storage_id": sid,
+            "storage_name": storage.get("name", sid) if storage else "",
+            "sub_path": sub,
+            "last_read_message_id": wm,
+            "collected": wm > 0,
+        }
+        if storage:
+            rbase = (storage.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
+            rel = "/".join(x for x in [rbase, sub, title, "YYYY_MM"] if x)
+            item["remote_dir"] = f"{remote_name_of(sid)}:{rel}"
+            item["remote_path"] = rel
+            item["local_path"] = "/".join(x for x in [base, sub, title, "YYYY_MM"] if x)
+            bound.append(item)
+        else:
+            item["reason"] = "未绑定网盘：采集后只留在本地，不会上传"
+            unbound.append(item)
+    return {"bound": bound, "unbound": unbound}
+
+@app.get("/api/collect/history/preview", dependencies=[Depends(verify_auth)])
+def collect_history_preview():
+    """只读预览：哪些频道已绑定网盘、各自采到哪、会传到哪个路径。"""
+    data = _describe_bound_channels(load_config())
+    return {
+        "bound": data["bound"],
+        "unbound": data["unbound"],
+        "bound_count": len(data["bound"]),
+        "unbound_count": len(data["unbound"]),
+        "pending": sum(1 for x in data["bound"] if not x["collected"]),
+        "running": bool(engine_thread and engine_thread.is_alive()),
+    }
+
+@app.post("/api/collect/history", dependencies=[Depends(verify_auth)])
+def collect_history(req: CollectHistoryReq):
+    cfg = load_config()
+    storage_ids = {s["id"] for s in cfg.get("_ui_storages", [])}
+    title_map = cfg.get("_ui_chat_titles", {})
+    wanted = {int(x) for x in req.chat_ids} if req.chat_ids else None
+    touched, skipped = [], []
+    for c in cfg.get("chat", []):
+        cid = c.get("chat_id")
+        if wanted is not None and cid not in wanted:
+            continue
+        title = title_map.get(str(cid), str(cid))
+        sid = c.get("_storage_id", "")
+        if not sid or sid not in storage_ids:
+            skipped.append({"chat_id": cid, "title": title, "reason": "未绑定网盘，已跳过"})
+            continue
+        old = int(c.get("last_read_message_id", 0) or 0)
+        new = 0 if req.reset_watermark else old
+        c["last_read_message_id"] = new
+        touched.append({"chat_id": cid, "title": title,
+                        "old_watermark": old, "new_watermark": new})
+
+    if not touched:
+        raise HTTPException(status_code=422,
+                            detail="没有可采集的频道：请先在「监控队列」里给频道绑定网盘")
+
+    if req.dry_run:
+        return {"ok": True, "dry_run": True, "channels": touched,
+                "skipped": skipped, "engine_started": False, "total": len(touched)}
+
+    # 引擎每组跑完会把组内水位线回写主配置；若此时直接归零，会被旧值覆盖 → 先停再改
+    was_running = bool(engine_thread and engine_thread.is_alive())
+    if was_running:
+        control_engine("stop")
+        if engine_thread:
+            engine_thread.join(timeout=20)
+
+    dump_config(cfg)
+    link_engine_config(CONFIG_PATH)
+
+    started = False
+    if req.start_engine:
+        control_engine("start")
+        started = True
+
+    mode = "重采全部历史" if req.reset_watermark else "只补增量"
+    engine_logs.append(
+        f"[{time.strftime('%H:%M:%S')}] 🧲 一键采集历史：{len(touched)} 个频道（{mode}）"
+        + ("，引擎已启动" if started else "")
+    )
+    return {
+        "ok": True,
+        "channels": touched,
+        "skipped": skipped,
+        "mode": mode,
+        "engine_started": started,
+        "was_running": was_running,
+        "total": len(touched),
+    }
+
 # ==================== 配置 API ====================
 
 class ConfigPayload(BaseModel):
