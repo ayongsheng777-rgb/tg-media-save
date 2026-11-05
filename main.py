@@ -63,6 +63,22 @@ _otp_pending = {"secret": "", "created_at": 0.0}
 
 ALLOWED_STORAGE_TYPES = {"webdav", "smb", "tgfs"}
 
+# 落盘文件名的生成方式。引擎（module/app.py:get_file_name）只认三个占位符：
+#   message_id / file_name / caption
+# 它把命中的片段用 file_name_prefix_split（默认 " - "）连起来，扩展名由引擎另外追加。
+# 默认的 ["message_id", "file_name"] 会得到 "38 - IMG_4159.MOV" —— 频道里看到的
+# 名字跟原帖内容毫无关系，这就是「转存下来一堆看不懂的文件名」的来源。
+# caption 的清洗（只取第一段、去掉广告尾巴）在 patch/media_downloader.py 里做。
+FILE_NAME_MODES = {
+    # 原帖标题 + 消息 ID：可读，且同一月份内不会重名
+    "title_id": ["caption", "message_id"],
+    # 只要原帖标题：最干净；同月两条同名帖子会互相覆盖（TGFS 会保留历史版本）
+    "title": ["caption"],
+    # 旧行为：38 - IMG_4159.MOV
+    "legacy": ["message_id", "file_name"],
+}
+DEFAULT_FILE_NAME_MODE = "title_id"
+
 def normalize_storage_type(stype: str) -> str:
     """把历史配置里的存储类型收敛到当前支持集合。
 
@@ -682,6 +698,11 @@ def run_all_groups(auto: bool = False):
             run_cfg.pop("_ui_delete_after_upload", None)
             # 频道级子目录：本地根目录也下沉一层，使本地结构与远端 remote_dir 对齐
             run_cfg["save_path"] = f"{base_save_path}/{sub_path}" if sub_path else base_save_path
+            # 文件名：默认用原帖标题，落盘和频道里看到的是「标题 - 38.MOV」
+            run_cfg["file_name_prefix"] = FILE_NAME_MODES.get(
+                cfg.get("_ui_file_name_mode") or DEFAULT_FILE_NAME_MODE,
+                FILE_NAME_MODES[DEFAULT_FILE_NAME_MODE],
+            )
 
             tmp = Path(f"/app/config_store/_run_group_{idx}.yaml")
             # 先写 .tmp 再 replace：引擎随时可能读到这份配置，避免半截 YAML
@@ -1436,6 +1457,8 @@ class ConfigPayload(BaseModel):
     api_hash: str
     save_path: str
     file_path_prefix: List[str] = ["chat_title", "media_datetime"]
+    # 落盘文件名生成方式，见 FILE_NAME_MODES
+    file_name_mode: str = DEFAULT_FILE_NAME_MODE
     media_types: List[str] = ["photo", "video"]
     proxy_enable: bool = False
     proxy_scheme: str = "socks5"
@@ -1486,6 +1509,7 @@ def get_config():
         "api_id": cfg.get("api_id", 123456), "api_hash": cfg.get("api_hash", ""),
         "save_path": cfg.get("save_path", "/app/save"),
         "file_path_prefix": cfg.get("file_path_prefix", ["chat_title", "media_datetime"]),
+        "file_name_mode": cfg.get("_ui_file_name_mode") or DEFAULT_FILE_NAME_MODE,
         "media_types": cfg.get("media_types", ["photo", "video"]),
         # 登录设置：手机号持久化回显
         "login_phone": get_login_state().get("phone", ""),
@@ -1513,6 +1537,12 @@ def save_config(payload: ConfigPayload):
     cfg["api_id"], cfg["api_hash"] = payload.api_id, payload.api_hash.strip()
     cfg["save_path"], cfg["media_types"] = payload.save_path, payload.media_types
     cfg["file_path_prefix"] = ["chat_title", "media_datetime"]
+    # 文件名模式存成 _ui_ 键：它不进引擎配置本体，由 run_all_groups 翻译成
+    # file_name_prefix 再写进每组的临时配置。非法值一律回落到默认。
+    cfg["_ui_file_name_mode"] = (
+        payload.file_name_mode if payload.file_name_mode in FILE_NAME_MODES
+        else DEFAULT_FILE_NAME_MODE
+    )
 
     # --- 登录设置：手机号持久化（与其它 _ui_ 状态同处一个键，避免散落）---
     login_state = dict(cfg.get("_ui_login") or {})

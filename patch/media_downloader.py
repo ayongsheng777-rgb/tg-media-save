@@ -19,6 +19,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import time
 from typing import List, Optional, Tuple, Union
@@ -61,6 +62,44 @@ CONFIG_NAME = "config.yaml"
 DATA_FILE_NAME = "data.yaml"
 APPLICATION_NAME = "media_downloader"
 app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
+
+# 文件名里能用的标题最长多少个字符。
+# 文件系统限 255 字节，中文一个字 3 字节；再加上 "<标题> - <消息ID>.MOV" 的
+# 连接符和扩展名，50 字（150 字节）留足余量。实测频道标题多在 30 字上下。
+CAPTION_TITLE_LIMIT = 50
+
+# 标题和正文的分隔：原始 caption 用 \n\n，被 validate_title 换成 _ 之后是 __
+_TITLE_SPLIT = re.compile(r"\n|__")
+
+# 超长标题优先在这些标点处截断，避免把句子劈成两半
+_TITLE_CUT_POINTS = "，,。.！!？?；;、"
+
+
+def caption_to_title(caption: Optional[str]) -> Optional[str]:
+    """从帖子 caption 里取出「标题」那一段，用作落盘文件名。
+
+    源频道的 caption 结构是固定的三段：
+
+        😈<正文标题>161\\n\\n😈此群随时被和谐，赶快加入会员防走丢！\\n\\n🥳点击办理会员…
+
+    整段拿去当文件名会得到一个带换行、带广告、八十多字的怪名字，
+    所以只取第一段并限长。
+    """
+    if not caption:
+        return None
+    first = _TITLE_SPLIT.split(caption.strip(), maxsplit=1)[0].strip()
+    if not first:
+        return None
+    if len(first) <= CAPTION_TITLE_LIMIT:
+        return first
+
+    head = first[:CAPTION_TITLE_LIMIT]
+    # 硬截会得到「…女神有所察觉，浅」这种半句话，观感很差；
+    # 退到最后一个标点处更自然。标点太靠前（<12 字）就不值得，宁可硬截。
+    cut = max(head.rfind(ch) for ch in _TITLE_CUT_POINTS)
+    if cut >= 12:
+        head = head[:cut]
+    return head
 
 queue: asyncio.Queue = asyncio.Queue()
 RETRY_TIME_OUT = 3
@@ -234,6 +273,10 @@ async def _get_media_meta(
         file_name = getattr(media_obj, "file_name", None)
         caption = getattr(message, "caption", None)
 
+        # 必须在下面 validate_title(caption) 之前把标题抠出来 —— 那个函数会把
+        # 换行统一换成下划线，之后再切段落就只能靠猜了。
+        title_for_name = caption_to_title(caption)
+
         file_name_suffix = ".unknown"
         if not file_name:
             file_name_suffix = get_extension(
@@ -256,12 +299,18 @@ async def _get_media_meta(
             )
         else:
             caption = app.get_caption_name(chat_id, message.media_group_id)
+            # 相册里后续几张没有自己的 caption，走的是同组第一张存下来的那份，
+            # 而那份已经被 validate_title 换成下划线形态了，所以再试一次。
+            if title_for_name is None:
+                title_for_name = caption_to_title(caption)
 
         if not file_name and message.photo:
             file_name = f"{message.photo.file_unique_id}"
 
         gen_file_name = (
-            app.get_file_name(message.id, file_name, caption) + file_name_suffix
+            app.get_file_name(
+                message.id, file_name, title_for_name or caption
+            ) + file_name_suffix
         )
 
         file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)

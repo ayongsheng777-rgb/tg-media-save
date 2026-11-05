@@ -545,12 +545,24 @@ body {
           </div>
         </div>
 
-        <div v-if="cfg.storages && cfg.storages.length > 0" class="flex items-center gap-4 pt-2">
+        <div v-if="cfg.storages && cfg.storages.length > 0" class="flex flex-wrap items-center gap-x-6 gap-y-3 pt-2">
           <label class="flex items-center gap-2 text-sm">
             <input type="checkbox" v-model="cfg.delete_after_upload" class="w-4 h-4">
             上传后删除本地文件
           </label>
+          <div class="flex items-center gap-2 text-sm">
+            <span class="whitespace-nowrap">落盘文件名</span>
+            <select v-model="cfg.file_name_mode" class="qb-input" style="width:auto;min-width:200px">
+              <option value="title_id">原帖标题 - 消息ID（推荐）</option>
+              <option value="title">只用原帖标题</option>
+              <option value="legacy">消息ID - 原文件名（旧行为）</option>
+            </select>
+          </div>
         </div>
+        <p class="qb-hint" style="margin-top:8px">
+          文件名取原帖 caption 的<b>第一段</b>（后面固定的广告尾巴会被丢掉），最多 60 字。
+          原帖没有标题时自动退回消息 ID。改这里只影响<b>之后新下载</b>的文件，已入库的不动。
+        </p>
       </section>
 
       <!-- ==================== TGFS 集成：面板内配置并代管 TGFS 容器 ==================== -->
@@ -1019,6 +1031,8 @@ createApp({
       session: { days: 1, long_lived: false, expires_at: 0, remain_days: 0, remain_seconds: 0 },
       cfg: {
         file_path_prefix: ['chat_title', 'media_datetime'], media_types: ['photo', 'video'], chats: [], storages: [],
+        // 落盘文件名：title_id = 「原帖标题 - 消息ID」，见后端 FILE_NAME_MODES
+        file_name_mode: 'title_id',
         proxy_enable: false, proxy_scheme: 'socks5', proxy_host: '127.0.0.1', proxy_port: 7890,
         proxy_user: '', proxy_pass: '', proxy_has_pass: false,
         login_phone: '',
@@ -1134,7 +1148,8 @@ createApp({
       const defaults = {
         chats: [], storages: [], proxy_enable: false, proxy_scheme: 'socks5',
         proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false,
-        login_phone: '', engine_autostart: false, last_run: {}
+        login_phone: '', engine_autostart: false, last_run: {},
+        file_name_mode: 'title_id'
       };
       this.cfg = Object.assign({}, defaults, d);
       this.authed = true;

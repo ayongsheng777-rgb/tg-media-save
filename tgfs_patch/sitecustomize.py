@@ -26,6 +26,7 @@ TGFS 于是永远起不来、WebDAV 端口也不监听。
 
 import logging
 import os
+import re
 
 _log = logging.getLogger("tgfs.proxy_patch")
 
@@ -109,3 +110,44 @@ def _install():
 
 
 _install()
+
+
+# ==================== 文件名去 "[partN]" 前缀 ====================
+# TGFS 的 core/repository/impl/file_content/__init__.py:86 无条件执行
+#     file_msg.name = f"[part{i+1}]{file_name}"
+# 而分片阈值 PART_SIZE_DEFAULT 是 2GB —— 实际文件只有几十 MB，永远只有一个分片，
+# 于是频道里每个文件都叫 "[part1]xxx.MOV"，这个前缀一点信息量都没有。
+#
+# 同样不改 TGFS 源码：TGFS 上传走 messages.SendMedia + InputMediaUploadedDocument，
+# 文件名最终落在 DocumentAttributeFilename.file_name 上，包一层构造就够。
+# 索引靠 message_id 而不是名字（_validate_fv 只读 document.size），
+# 所以这里只影响 Telegram 里的显示效果，不影响 WebDAV 读写。
+_PART_PREFIX = re.compile(r"^\[part\d+\]")
+
+
+def _install_filename_patch():
+    try:
+        from pyrogram.raw.types import DocumentAttributeFilename
+    except Exception as exc:                                  # noqa: BLE001
+        _log.warning("文件名补丁：import DocumentAttributeFilename 失败（%s），跳过", exc)
+        return
+
+    orig = DocumentAttributeFilename.__init__
+    if getattr(orig, "_tgfs_part_patched", False):
+        return
+
+    def __init__(self, *args, **kwargs):
+        # pyrogram 的 raw 类型签名是 __init__(self, *, file_name)，关键字必传；
+        # 这里仍兼容一下位置传参，免得 pyrogram 换版本后静默失效。
+        if isinstance(kwargs.get("file_name"), str):
+            kwargs["file_name"] = _PART_PREFIX.sub("", kwargs["file_name"])
+        elif args and isinstance(args[0], str):
+            args = (_PART_PREFIX.sub("", args[0]),) + args[1:]
+        return orig(self, *args, **kwargs)
+
+    __init__._tgfs_part_patched = True
+    DocumentAttributeFilename.__init__ = __init__
+    _log.info("文件名补丁已生效：上传到频道的文件不再带 [partN] 前缀")
+
+
+_install_filename_patch()
