@@ -870,7 +870,7 @@ body {
       </div>
       <section class="qb-card accent-mint" id="engine-run-card">
         <div class="qb-card-title flex flex-wrap justify-between items-center gap-2">
-          <span>⚙️ 采集记录与自动补采</span>
+          <span>⚙️ 采集记录与自动启动</span>
           <span class="qb-tag" :class="cfg.running ? 'qb-tag-ok' : 'qb-tag-info'">
             {{ cfg.running ? '本轮进行中' : '空闲' }}
           </span>
@@ -907,12 +907,12 @@ body {
 
         <label class="qb-check" style="margin-top:14px">
           <input type="checkbox" v-model="cfg.engine_autostart" @change="toggleAutostart">
-          <span>容器 / NAS 重启后自动补一轮增量</span>
+          <span>容器 / NAS 重启后自动开启采集</span>
         </label>
         <div class="qb-hint" style="margin-top:6px">
-          只采「上次水位线之后」的新消息，采过的不会重扫（水位线就是采集记录本身）。
-          水位线为 0、从没采过的频道会被跳过 —— 那种频道跑起来等于全量拉历史，
-          需要你先手动跑一次建立记录。
+          重启后自动跑一轮，范围和手动点「▶ 启动」一样：水位线为 0、从没采过的
+          频道也会跑。采过的文件不会重下、不会重复传（本地已下载的跳过，
+          已上传的有去重挡着），只是第一次全量会花些时间。
         </div>
       </section>
 

@@ -649,9 +649,11 @@ def strip_ui_keys(cfg) -> dict:
 def run_all_groups(auto: bool = False):
     """按网盘分组串行运行下载引擎，实现真正的频道级存储路由。
 
-    auto=True 表示这轮是「容器启动后自动补一轮」，语义与手动点「▶ 启动」不同：
-    手动启动用户心里有数，自动启动不该替人做决定，所以水位线为 0（从没采过）
-    的频道会被跳过 —— 那种频道跑起来等于全量拉历史，可能几百 GB。
+    auto=True 表示这轮是「容器启动后自动跑一轮」（触发方式记为 auto）。
+    2026-11-06 用户要求：镜像重启与 NAS 启动后引擎自动开启，自动轮与手动轮
+    跑的范围相同 —— 水位线为 0（从没采过）的频道也不跳过（以前这里会跳过，
+    怕全量拉历史；用户已明确要自动跑）。重复不用担心：引擎会跳过本地已下载
+    的文件，rclone 传的时候也有 --ignore-existing，已上传的不会重复传。
     """
     global downloader_proc
     started_at = time.time()
@@ -676,15 +678,9 @@ def run_all_groups(auto: bool = False):
                 engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⏹ 收到停止信号，中止后续分组")
                 break
 
-            if auto:
-                # 自动启动只补增量：水位线 > 0 才说明这个频道采过，
-                # 引擎会用 offset_id=last_read_message_id 从它之后往新处取。
-                kept = [c for c in chats if int(c.get("last_read_message_id", 0) or 0) > 0]
-                if len(kept) != len(chats):
-                    auto_skipped += len(chats) - len(kept)
-                chats = kept
-                if not chats:
-                    continue
+            # 2026-11-06 用户要求自动轮也跑全部频道：以前这里会跳过水位线为 0
+            # 的频道（只补增量），现已取消 —— 自动轮与手动轮范围相同。
+            # auto_skipped 保留在记录里，恒为 0。
 
             label = storages[sid].get("name", sid) if sid else "本地存储"
             if sub_path:
@@ -2294,7 +2290,7 @@ def get_logs():
 
 @app.post("/api/engine/autostart", dependencies=[Depends(verify_auth)])
 def set_engine_autostart(enabled: bool = False):
-    """开关「容器启动后自动补一轮增量」。"""
+    """开关「容器启动后自动开启一轮采集」。"""
     with _yaml_lock:
         cfg = load_config()
         cfg["_ui_engine_autostart"] = bool(enabled)
@@ -2304,16 +2300,16 @@ def set_engine_autostart(enabled: bool = False):
 
 @app.on_event("startup")
 def _autostart_engine_on_boot():
-    """容器 / NAS 重启后自动补一轮**增量**采集。
+    """容器 / NAS 重启后自动开启一轮采集。
 
-    为什么是增量而不是重扫：引擎取消息用的是
-    `offset_id=last_read_message_id` + `reverse=True`，即从上次记录的水位线
-    往**更新**的方向取，之前采过的一律不再碰。水位线就是「采集记录」本身。
+    2026-11-06 用户要求：镜像重启与 NAS 启动后引擎自动开启。
+    自动轮与手动点「▶ 启动」跑的范围相同 —— 水位线为 0、从没采过的频道
+    也不跳过（以前这里只补增量，0 水位线的频道会被跳过）。重复不用担心：
+    引擎取消息用 offset_id=last_read_message_id + reverse=True，采过的
+    不会重下；本地已下载的文件会跳过，已上传的 rclone 有 --ignore-existing
+    挡着，不会重复传。
     唯一会把水位线归零的是「一键采集历史」按钮，那是用户显式点的特殊操作，
     自动启动走不到那条路。
-
-    水位线为 0（从没采过）的频道会被 run_all_groups(auto=True) 跳过 ——
-    那种频道跑起来等于全量拉历史，可能几百 GB，不该由重启替用户决定。
     """
     def _worker():
         # 面板起来后 rclone、网盘凭据、session 文件还要几秒才就绪；
@@ -2323,18 +2319,10 @@ def _autostart_engine_on_boot():
             cfg = load_config()
             if not cfg.get("_ui_engine_autostart"):
                 return
-            ready = [c for c in cfg.get("chat", [])
-                     if int(c.get("last_read_message_id", 0) or 0) > 0]
-            if not ready:
-                engine_logs.append(
-                    f"[{time.strftime('%H:%M:%S')}] ⚠ 自动采集已开启，但没有可增量补的频道"
-                    "（水位线都是 0，需先手动跑一次建立采集记录）"
-                )
-                return
             sync_session_files()
             if _start_engine(auto=True):
                 engine_logs.append(
-                    f"[{time.strftime('%H:%M:%S')}] 🚀 容器启动，自动补采增量：{len(ready)} 个频道"
+                    f"[{time.strftime('%H:%M:%S')}] 🚀 容器启动，自动开启采集"
                 )
         except Exception as exc:
             engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 自动采集启动失败：{exc}")
