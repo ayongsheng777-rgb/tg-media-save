@@ -102,6 +102,60 @@ _config_cache = {}   # 配置解析成功后的快照，用于读失败时兜底
 engine_logs = deque(maxlen=500)
 session_stats = {"downloaded_count": 0, "last_file": "", "start_time": 0}
 
+# ==================== 引擎日志过滤 ====================
+# 引擎上传走 `rclone copy --progress`（module/cloud_drive.py 里拼的命令），
+# 而 rclone 每 0.5 秒就往 stdout 打一段统计：
+#     Transferred:   4.496 MiB / 14.111 MiB, 32%, 728 B/s, ETA 3h50m43s
+#     Transferring:
+#      *   5 - IMG_2468.MOV: 31% /14.111Mi, 776/s, 3h36m15s
+#     Elapsed time:      1m49.5s
+# 引擎把每一行都 print 出来，面板原先原样 append 进 engine_logs。
+# 问题是 engine_logs 是 maxlen=500 的环形缓冲，而引擎会**并发**上传 4~6 个文件，
+# 每个文件每 0.5 秒刷 4 行 —— 十几秒就把整个缓冲冲干净，真正的
+# 「下载成功 / upload file ... success」全被挤掉，用户看到的「采集反馈」只剩百分比。
+# 这里只做两件事：丢掉纯进度行；同一个文件每跨 25% 才留一条。
+_RCLONE_NOISE_PREFIX = (
+    "transferred:", "transferring:", "elapsed time:", "checks:", "errors:",
+    "deleted:", "renamed:", "server side copies:", "server side moves:",
+    "waiting for checks to finish", "cancelling",
+)
+# 形如 ` *   5 - IMG_2468.MOV: 31% /14.111Mi, 776/s, 3h36m15s`
+_RCLONE_PROGRESS = re.compile(r"^\*\s+(?P<name>.+?):\s+(?P<pct>\d+)%")
+# rclone 用 \r 原地刷新进度，非 TTY 下这些段会粘在同一个 readline 结果里
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def filter_engine_output(raw: str, progress: dict) -> list:
+    """把引擎一行原始输出拆成若干条值得展示的日志；返回空列表表示整行丢弃。
+
+    progress 是本次分组运行共享的 `{文件名: 已记录到的百分比档位}`，
+    用来给同一个文件限流 —— 否则 25/26/27/28% 这种细微变化照样刷屏。
+    """
+    kept = []
+    for seg in _ANSI_ESCAPE.sub("", raw).replace("\r", "\n").split("\n"):
+        seg = seg.strip()
+        # 空行，以及 rclone 刷新时留下的纯 "*"、"-"、空白
+        if not seg or set(seg) <= {"*", "-", " "}:
+            continue
+        m = _RCLONE_PROGRESS.match(seg)
+        if m:
+            name = m.group("name").strip().split("/")[-1]
+            pct = int(m.group("pct"))
+            bucket = pct // 25          # 0 / 25 / 50 / 75 / 100 五档
+            if progress.get(name) == bucket:
+                continue
+            progress[name] = bucket
+            kept.append(f"⬆ {name} {pct}%")
+            continue
+        # 剩余以 "*" 开头的都是「未知大小的文件正在传」，没有信息量
+        if seg.startswith("*"):
+            continue
+        if seg.lower().startswith(_RCLONE_NOISE_PREFIX):
+            continue
+        kept.append(seg[:300])          # 极端长的合并行截断，别撑爆前端
+    return kept
+
+
 # ==================== 初始化 ====================
 
 def sync_session_files():
@@ -484,6 +538,49 @@ def describe_channel_target(c, title_map, storages_by_id, base_save_path) -> str
     return f"• {title} → 本地存储：`{rel}/`"
 
 
+def flush_group_watermark(group_cfg: Path) -> int:
+    """把引擎写进分组配置的水位线同步回主配置；返回本次推进了几个频道。
+
+    为什么需要这一步：引擎只认它自己读到的那份配置（/app/config.yaml 这个符号
+    链接指向本组临时文件），而面板真正保存的是 config_store/config.yaml。
+    引擎跑完会把 last_read_message_id 写进**链接指向的那份**，必须搬回主配置，
+    否则下一轮又从头开始。
+
+    注意引擎是「整轮结束才写一次」：patch/media_downloader.py 第 718 行在 finally
+    里调 app.update_config()，而 update_config 内部还有 `if value.finish_task` 的
+    门槛。所以运行途中分组配置里一直是旧值 —— 这也意味着**中途重启会丢掉本轮
+    进度**，那个频道下次要从头扫（已上传的文件有 rclone --ignore-existing 挡着，
+    不会重复上传，但会白下一遍）。这是上游引擎的行为，面板侧改不了。
+
+    以「链接此刻实际指向哪里」为准：引擎可能就地改写它读到的那份配置，也可能
+    把符号链接换成了普通文件，只认传进来的路径会读到旧值（水位线被打回 0）。
+    """
+    src = group_cfg
+    try:
+        resolved = ENGINE_CONFIG_LINK.resolve()
+        if resolved.exists():
+            src = resolved
+    except Exception:
+        pass
+    with open(src, "r", encoding="utf-8") as f:
+        updated = _yaml_load(f) or {}
+    id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0) or 0)
+              for u in updated.get("chat", [])}
+    if not id_map:
+        return 0
+    with _yaml_lock:
+        main_cfg = load_config()
+        moved = 0
+        for c in main_cfg.get("chat", []):
+            key = str(c.get("chat_id"))
+            if key in id_map and id_map[key] > int(c.get("last_read_message_id", 0) or 0):
+                c["last_read_message_id"] = id_map[key]
+                moved += 1
+        if moved:
+            dump_config(main_cfg)
+    return moved
+
+
 def build_groups(cfg):
     """按 (存储目标, 频道子目录) 分组。
 
@@ -601,36 +698,21 @@ def run_all_groups(auto: bool = False):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
             )
             downloader_proc = proc
+            # 每个分组一份进度档位表：上一组的同名文件不该把这一组的进度压掉
+            progress = {}
             for raw_line in iter(proc.stdout.readline, ""):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] {line}")
-                if any(k in line.lower() for k in ["successfully downloaded", "下载成功", "成功下载", "upload file"]):
-                    session_stats["downloaded_count"] += 1
+                for line in filter_engine_output(raw_line, progress):
+                    engine_logs.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+                    if any(k in line.lower() for k in ["successfully downloaded", "下载成功", "成功下载", "upload file"]):
+                        session_stats["downloaded_count"] += 1
             proc.wait()
 
-            # 回写本组频道的水位线到主配置。
-            # 以「链接此刻实际指向哪里」为准：引擎可能就地改写它读到的那份配置，
-            # 也可能把符号链接换成了普通文件，只认 tmp 会读到旧值（水位线被打回 0）。
+            # 组结束后回写水位线。
+            # 引擎只在整轮 finally 里调一次 app.update_config()（patch/media_downloader.py
+            # 第 718 行），而且 update_config 内部还有 `if value.finish_task` 的门槛 ——
+            # 所以运行途中这份分组配置里一直是旧值，中途同步没有意义，只能等这里。
             try:
-                src = tmp
-                try:
-                    resolved = ENGINE_CONFIG_LINK.resolve()
-                    if resolved.exists():
-                        src = resolved
-                except Exception:
-                    pass
-                with open(src, "r", encoding="utf-8") as f:
-                    updated = _yaml_load(f) or {}
-                id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0) or 0)
-                          for u in updated.get("chat", [])}
-                main_cfg = load_config()
-                for c in main_cfg.get("chat", []):
-                    key = str(c.get("chat_id"))
-                    if key in id_map and id_map[key] > int(c.get("last_read_message_id", 0) or 0):
-                        c["last_read_message_id"] = id_map[key]
-                dump_config(main_cfg)
+                flush_group_watermark(tmp)
             except Exception as e:
                 engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 水位线回写失败: {e}")
             finally:
