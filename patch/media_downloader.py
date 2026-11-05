@@ -391,9 +391,21 @@ async def download_task(
     )
 
     # rclone upload
+    # 2026-11-06 补：本地已存在的文件也会传。以前这里只认 SuccessDownload，
+    # 而 download_media 碰到本地已有文件会直接返回 SkipDownload（不下载），
+    # 结果就是：某次上传失败（比如 TGFS 挂了）留下的本地文件，之后每一轮都
+    # 被跳过下载、又因为不是 SuccessDownload 而跳过上传，永远卡在本地传不
+    # 上去（2026-11-05 那批 19 个文件就是这么 stranded 的）。现在只要本地
+    # 文件真实存在且非空（file_size > 0）就传；rclone 自带 --ignore-existing，
+    # 网盘里已有的不会重复传。格式被排除的文件走不到这里：_can_download
+    # 不通过时 file_name 对应的本地文件基本不存在（引擎从不下载它），
+    # 即便个别历史文件在，也只是传到用户自己的网盘，无害。
     if (
         not node.upload_telegram_chat_id
-        and download_status is DownloadStatus.SuccessDownload
+        and (
+            download_status is DownloadStatus.SuccessDownload
+            or (download_status is DownloadStatus.SkipDownload and file_size > 0)
+        )
     ):
         ui_file_name = file_name
         if app.hide_file_name:
