@@ -189,6 +189,8 @@ body {
 .qb-lib-item { background:rgba(255,255,255,.6); border:1.5px solid rgba(255,255,255,.95); border-radius:14px; overflow:hidden; }
 .qb-lib-item .thumb { height:132px; background:#10161a; display:flex; align-items:center; justify-content:center; overflow:hidden; }
 .qb-lib-item .thumb img, .qb-lib-item .thumb video { width:100%; height:100%; object-fit:cover; display:block; }
+.qb-lib-item .thumb .ph { font-size:11px; color:#8a97a0; letter-spacing:.5px; }
+.qb-lib-item .thumb img { background:#0d1216; }
 .qb-lib-item .cap { padding:7px 9px; font-size:11.5px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .qb-lib-item .sub { padding:0 9px 8px; font-size:10.5px; color:var(--ink-soft); display:flex; justify-content:space-between; gap:6px; }
 @media (max-width:560px) { .qb-lib-grid { grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:9px; } .qb-lib-item .thumb { height:104px; } }
@@ -805,6 +807,11 @@ body {
             需要最新数据点「🔄 刷新」。</div>
         </div>
 
+        <div v-if="lib.items.length" class="qb-hint" style="margin-top:10px">
+          缩略图首次生成要回网盘取原图（每张约 1~5 秒，十几张同时抓），生成后缓存在 NAS 上，
+          再次打开是秒开。视频点播放才会开始读取。
+        </div>
+
         <div v-else-if="!lib.loading && !lib.items.length" class="qb-hint" style="margin-top:16px">
           这个网盘目录下还没有媒体文件。可能是频道还没采集完，或远程目录填错了。
         </div>
@@ -812,8 +819,12 @@ body {
         <div class="qb-lib-grid">
           <div v-for="item in lib.items" :key="item.path" class="qb-lib-item">
             <div class="thumb">
-              <img v-if="item.type==='image'" :src="libRawUrl(item)" :alt="item.name" loading="lazy">
-              <video v-else :src="libRawUrl(item)" controls preload="metadata"></video>
+              <template v-if="item.type==='image'">
+                <img v-if="!item._bad" :src="libThumbUrl(item)" :alt="item.name"
+                     loading="lazy" decoding="async" @error="item._bad = true">
+                <span v-else class="ph">🖼 无法预览</span>
+              </template>
+              <video v-else :src="libRawUrl(item)" controls preload="none"></video>
             </div>
             <div class="cap" :title="item.path">{{ item.name }}</div>
             <div class="sub">
@@ -1204,14 +1215,20 @@ createApp({
       return '/api/library/raw?sid=' + encodeURIComponent(this.lib.sid)
            + '&path=' + encodeURIComponent(item.path);
     },
+    libThumbUrl(item) {
+      // 列表一律走缩略图：原图单张 178KB / 5 秒，一屏几十张会卡死
+      return '/api/library/thumb?sid=' + encodeURIComponent(this.lib.sid)
+           + '&path=' + encodeURIComponent(item.path) + '&w=400';
+    },
     async fetchLib(reset, refresh) {
       if (!this.lib.sid) return;
-      if (reset) { this.lib.items = []; this.lib.offset = 0; this.lib.has_more = false; }
+      // 切筛选条件时不清空旧列表，避免白屏等 10 秒；新数据到了整体替换
+      if (reset) { this.lib.offset = 0; this.lib.has_more = false; }
       this.lib.loading = true;
       this.lib.err = '';
       const params = new URLSearchParams({
         sid: this.lib.sid, q: this.lib.q || '', kind: this.lib.kind || '',
-        dir: this.lib.dir || '', limit: '120', offset: String(reset ? 0 : this.lib.offset),
+        dir: this.lib.dir || '', limit: '48', offset: String(reset ? 0 : this.lib.offset),
       });
       if (refresh) params.set('refresh', 'true');
       try {

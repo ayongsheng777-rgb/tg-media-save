@@ -3,6 +3,7 @@ FROM tangyoha/telegram_media_downloader:latest
 WORKDIR /app
 
 # 安装 Web 管理、OTP 鉴权、JWT、ruamel.yaml 及支持 Socks5 代理的 httpx 依赖
+# pillow 用于预览库缩略图（原图 178KB/5 秒，缩略图约 25KB 且落盘缓存）
 # 境内网络 pip 直连较慢时，可用本地 .env 里的 BUILD_HTTP_PROXY / BUILD_HTTPS_PROXY 注入构建代理。
 # 代理账号密码只允许放在本地 .env（已 gitignore），不要写进镜像或提交到仓库。
 ARG HTTP_PROXY=
@@ -15,6 +16,7 @@ RUN pip install --no-cache-dir --timeout 60 \
     ruamel.yaml \
     python-multipart \
     aiofiles \
+    pillow \
     "httpx[socks]"
 
 # 覆盖引擎的两个文件（见 patch/ 下各文件头说明）：

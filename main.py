@@ -1,4 +1,4 @@
-import os, re, json, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
+import os, re, io, json, shutil, subprocess, threading, time, mimetypes, configparser, hmac, hashlib, base64, uuid, ipaddress, secrets, socket, asyncio, copy
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
@@ -13,9 +13,32 @@ from pyrogram import Client
 from pyrogram.enums import ChatType
 from pyrogram.errors import SessionPasswordNeeded
 
+# 缩略图依赖：镜像里没有 Pillow 时退化为「直接转发原图」，功能不中断
+try:
+    from PIL import Image, ImageOps
+except Exception:                                   # pragma: no cover
+    Image = ImageOps = None
+
 app = FastAPI(title="TG Media Downloader Pro Panel")
 yaml = YAML()
 yaml.preserve_quotes = True
+
+# ruamel 的 YAML 实例**不是线程安全的**：多个线程同时 load 同一个实例会随机抛
+# 「string index out of range」「expected <block end>」这类假解析错误。
+# load_config 于是回退到旧快照、甚至空 dict —— 预览库预热、并发请求都会踩到，
+# 历史上一度表现为「配置莫名其妙变空」。所有解析/序列化一律过这把锁。
+_yaml_lock = threading.RLock()
+
+
+def _yaml_load(stream):
+    with _yaml_lock:
+        return yaml.load(stream)
+
+
+def _yaml_dump(data, stream):
+    with _yaml_lock:
+        yaml.dump(data, stream)
+
 
 CONFIG_PATH = Path("/app/config_store/config.yaml")
 ENGINE_CONFIG_LINK = Path("/app/config.yaml")
@@ -109,7 +132,7 @@ def init_env():
             "chat": []
         }
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            yaml.dump(default_cfg, f)
+            _yaml_dump(default_cfg, f)
     # /app/config.yaml 绝不能指向主配置本身。
     # 引擎退出时用 open(config_file, "w") 回写水位线，这个写法会**穿透符号链接**，
     # 一旦链接指向 config_store/config.yaml，_ui_*（网盘、登录态、频道标题、
@@ -119,9 +142,9 @@ def init_env():
     try:
         if not ENGINE_IDLE_CONFIG.exists():
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                _boot_cfg = yaml.load(f) or {}
+                _boot_cfg = _yaml_load(f) or {}
             with open(ENGINE_IDLE_CONFIG, "w", encoding="utf-8") as f:
-                yaml.dump({k: v for k, v in _boot_cfg.items()
+                _yaml_dump({k: v for k, v in _boot_cfg.items()
                            if not str(k).startswith("_ui_")}, f)
     except Exception as _exc:
         print(f"[引擎配置] 初始化空闲副本失败: {_exc}")
@@ -153,7 +176,7 @@ def load_config():
     for attempt in (1, 2):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = yaml.load(f) or {}
+                cfg = _yaml_load(f) or {}
             _config_cache = cfg
             return cfg
         except Exception as e:
@@ -178,7 +201,7 @@ def dump_config(cfg):
     if cfg and not any(k.startswith("_ui_") for k in cfg):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                on_disk = yaml.load(f) or {}
+                on_disk = _yaml_load(f) or {}
             if any(k.startswith("_ui_") for k in on_disk):
                 print("[配置] 拒绝写入：待写配置不含 _ui_*，会覆盖掉网盘/登录态/通知设置")
                 return
@@ -186,7 +209,7 @@ def dump_config(cfg):
             pass
     tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f)
+        _yaml_dump(cfg, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, CONFIG_PATH)
@@ -214,7 +237,7 @@ def link_engine_idle():
     try:
         itmp = ENGINE_IDLE_CONFIG.with_suffix(".yaml.tmp")
         with open(itmp, "w", encoding="utf-8") as f:
-            yaml.dump(data, f)
+            _yaml_dump(data, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(itmp, ENGINE_IDLE_CONFIG)
@@ -547,7 +570,7 @@ def run_all_groups():
             # 先写 .tmp 再 replace：引擎随时可能读到这份配置，避免半截 YAML
             gtmp = tmp.with_suffix(".yaml.tmp")
             with open(gtmp, "w", encoding="utf-8") as f:
-                yaml.dump(run_cfg, f)
+                _yaml_dump(run_cfg, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(gtmp, tmp)
@@ -579,7 +602,7 @@ def run_all_groups():
                 except Exception:
                     pass
                 with open(src, "r", encoding="utf-8") as f:
-                    updated = yaml.load(f) or {}
+                    updated = _yaml_load(f) or {}
                 id_map = {str(u.get("chat_id")): int(u.get("last_read_message_id", 0) or 0)
                           for u in updated.get("chat", [])}
                 main_cfg = load_config()
@@ -1617,6 +1640,21 @@ _lib_servers: dict = {}
 _lib_list_cache: dict = {}
 _lib_lock = threading.Lock()
 
+# ---- 缩略图 ----
+# 原图单张 5 秒（TTFB 1.8s、178KB，pCloud WebDAV 往返慢，不是带宽问题）。
+# 一屏 120 张就要 100 秒以上，所以列表一律走缩略图 + 落盘缓存：
+#   178KB → 约 25KB，第二次起直接读 NAS 本地盘（毫秒级）。
+LIB_THUMB_DIR = Path("/app/config_store/thumbs")
+LIB_THUMB_W = 400                   # 长边；格子显示 164px，2x 屏够用
+LIB_THUMB_Q = 78
+# 实测 pCloud WebDAV 是延迟瓶颈（单张 5s，TTFB 1.8s），并发越高吞吐越好：
+# 4 并发 ≈ 0.35 张/秒，12 并发 ≈ 1.25 张/秒，24 并发开始被限流。
+# 全局压到 14（含浏览器自己的 6 个连接），后台预热占 10。
+LIB_THUMB_PARALLEL = 14
+_lib_thumb_sem = threading.Semaphore(LIB_THUMB_PARALLEL)
+_lib_thumb_inflight: dict = {}
+_lib_thumb_lock = threading.Lock()
+
 
 def _lib_storage(sid: str, cfg: dict) -> dict:
     st = next((s for s in cfg.get("_ui_storages", []) if s.get("id") == sid), None)
@@ -1730,6 +1768,107 @@ def _safe_rel(path: str) -> str:
     return p
 
 
+def _lib_url(sid: str, st: dict, rel: str) -> str:
+    """拼出 rclone serve 的本地 URL。
+
+    serve 挂在 remote 根上，而 lsjson 返回的 Path 是相对 remote_dir 的，
+    这里要把 remote_dir 前缀补回去，否则一律 404。
+    """
+    port = ensure_lib_server(sid)
+    base = (st.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
+    return f"http://{LIB_SERVE_HOST}:{port}/" + quote(f"{base}/{rel}")
+
+
+def _thumb_path(sid: str, rel: str, w: int) -> Path:
+    key = hashlib.md5(f"{sid}|{rel}|{w}".encode("utf-8")).hexdigest()
+    d = LIB_THUMB_DIR / key[:2]
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{key}.jpg"
+
+
+def _fetch_remote_bytes(sid: str, st: dict, rel: str, timeout: float = 120.0) -> bytes:
+    """从 rclone serve 取整个文件。
+
+    trust_env=False：容器里配了 HTTP_PROXY（代理是给 Telegram 用的），
+    走代理去访问 127.0.0.1 的 serve 会直接失败。
+    """
+    url = _lib_url(sid, st, rel)
+    with httpx.Client(timeout=httpx.Timeout(30.0, read=timeout), trust_env=False) as c:
+        r = c.get(url)
+    if r.status_code != 200:
+        raise RuntimeError(f"上游返回 {r.status_code}")
+    return r.content
+
+
+def _make_thumb(sid: str, st: dict, rel: str, w: int, dest: Path):
+    data = _fetch_remote_bytes(sid, st, rel)
+    im = Image.open(io.BytesIO(data))
+    im = ImageOps.exif_transpose(im)
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    im.thumbnail((w, w), Image.LANCZOS)
+    tmp = dest.with_suffix(".jpg.tmp")
+    im.save(tmp, "JPEG", quality=LIB_THUMB_Q, optimize=True, progressive=True)
+    os.replace(tmp, dest)
+
+
+def _gen_thumb(sid: str, st: dict, rel: str, w: int, dest: Path) -> bool:
+    """生成一张缩略图；同一张图被并发请求时只让一个去取原图。
+
+    浏览器一屏会同时发 6 个请求，滚动时同一张图也可能被重复请求。
+    没有这层去重，同一个文件会被下载十几遍，pCloud 立刻限流。
+    """
+    if Image is None:
+        return False
+    key = str(dest)
+    with _lib_thumb_lock:
+        ev = _lib_thumb_inflight.get(key)
+        owner = ev is None
+        if owner:
+            ev = threading.Event()
+            _lib_thumb_inflight[key] = ev
+    if not owner:
+        ev.wait(timeout=180)
+        return dest.exists() and dest.stat().st_size > 0
+    try:
+        with _lib_thumb_sem:
+            _make_thumb(sid, st, rel, w, dest)
+    except Exception as exc:
+        print(f"[预览库] 缩略图生成失败 {rel}: {exc}")
+        return False
+    finally:
+        with _lib_thumb_lock:
+            _lib_thumb_inflight.pop(key, None)
+        ev.set()
+    return dest.exists() and dest.stat().st_size > 0
+
+
+def _warm_thumbs(sid: str, st: dict, items: list, w: int = LIB_THUMB_W, workers: int = 10):
+    """后台预热当前页的缩略图，用户往下滚时基本已经在盘上了。"""
+    todo = [it["path"] for it in items if it.get("type") == "image"]
+    if Image is None or not todo:
+        return
+
+    def worker(chunk):
+        for rel in chunk:
+            if stop_event.is_set():
+                break
+            try:
+                dest = _thumb_path(sid, rel, w)
+                if dest.exists() and dest.stat().st_size > 0:
+                    continue
+                _gen_thumb(sid, st, rel, w, dest)
+            except Exception:
+                continue
+
+    # 轮转分片：若每个线程都从 todo[0] 开始遍历同一个列表，它们会全撞在
+    # 同一张图上、被 _gen_thumb 的 in-flight 去重串行化，实际只有 1 个线程
+    # 在干活（实测 6 线程预热 10 张要 18 秒，且 inflight 恒为 1）。
+    n = max(1, min(workers, len(todo)))
+    for i in range(n):
+        threading.Thread(target=worker, args=(todo[i::n],), daemon=True).start()
+
+
 @app.get("/api/library/sources", dependencies=[Depends(verify_auth)])
 def library_sources():
     """预览库的分类：一个存储方案一项（网盘账号1 / 网盘账号2 / webdav1 / tgfs …）。"""
@@ -1778,6 +1917,11 @@ def library_list(sid: str, q: str = "", kind: str = "", dir: str = "",
     limit = max(1, min(int(limit or 120), 400))
     offset = max(0, int(offset or 0))
     page = files[offset:offset + limit]
+    # 后台预热本页缩略图：返回列表时不阻塞，等浏览器来取时多半已经生成好了
+    try:
+        _warm_thumbs(sid, st, page)
+    except Exception:
+        pass
     return {
         "sid": sid,
         "name": st.get("name") or sid,
@@ -1793,6 +1937,25 @@ def library_list(sid: str, q: str = "", kind: str = "", dir: str = "",
     }
 
 
+@app.get("/api/library/thumb", dependencies=[Depends(verify_auth)])
+async def library_thumb(sid: str, path: str, w: int = LIB_THUMB_W):
+    """列表用缩略图。首次生成要回源取原图（约 5s），之后走盘上缓存。"""
+    cfg = load_config()
+    st = _lib_storage(sid, cfg)
+    rel = _safe_rel(path)
+    if os.path.splitext(rel)[1].lower() not in LIB_IMAGE_EXT:
+        raise HTTPException(status_code=400, detail="只有图片有缩略图")
+    w = max(96, min(int(w or LIB_THUMB_W), 800))
+    dest = _thumb_path(sid, rel, w)
+    if not (dest.exists() and dest.stat().st_size > 0):
+        # 生成要等网络，别阻塞事件循环
+        ok = await asyncio.to_thread(_gen_thumb, sid, st, rel, w, dest)
+        if not ok:
+            raise HTTPException(status_code=502, detail="缩略图生成失败")
+    return FileResponse(str(dest), media_type="image/jpeg",
+                        headers={"cache-control": "public, max-age=604800, immutable"})
+
+
 @app.get("/api/library/raw", dependencies=[Depends(verify_auth)])
 async def library_raw(sid: str, path: str, request: Request):
     """把网盘文件流式转发给浏览器，转发 Range 以支持视频拖动进度条。"""
@@ -1800,10 +1963,7 @@ async def library_raw(sid: str, path: str, request: Request):
     st = _lib_storage(sid, cfg)
     rel = _safe_rel(path)
     # ensure_lib_server 会阻塞（首次要等进程起监听），别在事件循环里等
-    port = await asyncio.to_thread(ensure_lib_server, sid)
-    # serve 挂在 remote 根上，而 lsjson 返回的 Path 是相对 remote_dir 的，这里要补回前缀
-    base = (st.get("remote_dir", "tg_backup") or "tg_backup").strip("/") or "tg_backup"
-    url = f"http://{LIB_SERVE_HOST}:{port}/" + quote(f"{base}/{rel}")
+    url = await asyncio.to_thread(_lib_url, sid, st, rel)
 
     fwd = {}
     rng = request.headers.get("range")
