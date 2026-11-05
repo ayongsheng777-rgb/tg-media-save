@@ -1009,7 +1009,9 @@ createApp({
       if (!t.docker_ok) return t.conf_exists ? '已配置 · 无法控制容器' : '未配置';
       if (c.status === 'not-created') return '已配置 · 容器未创建';
       // 容器可能正在等待配置文件（compose 里的等待循环），这时别误报成"未就绪"
-      if (!t.conf_exists) return c.running ? '等待填写配置' : '未配置';
+      // 未配置又没在跑 = 用户点过「停止」或从未启动，要跟"从没配过"区分开，
+      // 否则点完停止徽章还是「未配置」，会让人以为操作没生效。
+      if (!t.conf_exists) return c.running ? '等待填写配置' : '未配置 · 已停止';
       if (!c.running) return '已停止';
       const w = t.webdav || {};
       if (w.ok) return '运行中 · WebDAV 可用';
@@ -1160,6 +1162,10 @@ createApp({
     },
     async stopTgfs() {
       if (this.tgfs.busy) return;
+      // Docker 的 unless-stopped 语义：手动 stop 过的容器，宿主机重启后**不会**自动拉起。
+      // 用户点「停止」多半只是想临时停一下，所以先把后果说清楚。
+      if (!confirm('停止后，重启 NAS 时 TGFS 不会自动恢复（Docker unless-stopped 的语义）。\n'
+                 + '需要恢复请再点「↻ 重启 TGFS」。\n\n确定要停止吗？')) return;
       this.tgfs.busy = true; this.tgfs.msg = '';
       try {
         const r = await fetch('/api/tgfs/stop', { method: 'POST' });

@@ -1899,8 +1899,12 @@ def tgfs_save_config(req: TGFSConfigReq):
 
 @app.post("/api/tgfs/restart", dependencies=[Depends(verify_auth)])
 def tgfs_restart():
-    if not TGFS_CONF_PATH.exists():
-        raise HTTPException(status_code=400, detail="还没有生成 TGFS 配置，请先在上方保存配置")
+    # 这里**不再**因为「没有配置」就拒绝启动。
+    # 容器在 compose 里带了一个等待循环（`while [ ! -f /data/config.yaml ]`），
+    # 没配置时启动只是停在循环里空等，无害；但如果拒绝，就会出现死胡同：
+    # 未配置时「停止」能点成功，「重启」却被 400 挡住，用户只能去命令行
+    # `docker start tgfs` 才能把状态收回来。
+    conf_ok = TGFS_CONF_PATH.exists()
     try:
         _tgfs_docker("restart")
     except HTTPException as exc:
@@ -1908,13 +1912,17 @@ def tgfs_restart():
             _tgfs_docker("start")
         except HTTPException:
             raise exc from None
+    if not conf_ok:
+        return {"ok": True,
+                "msg": "TGFS 已启动，但还没生成配置，容器正等待你保存配置"}
     return {"ok": True, "msg": "TGFS 重启中"}
 
 
 @app.post("/api/tgfs/stop", dependencies=[Depends(verify_auth)])
 def tgfs_stop():
     _tgfs_docker("stop")
-    return {"ok": True, "msg": "TGFS 已停止"}
+    # Docker 的 unless-stopped 语义：手动 stop 过的容器，宿主机重启后不会自动拉起
+    return {"ok": True, "msg": "TGFS 已停止（重启 NAS 后不会自动恢复，需点「重启 TGFS」）"}
 
 
 @app.get("/api/tgfs/logs", dependencies=[Depends(verify_auth)])
