@@ -2285,6 +2285,12 @@ def get_logs():
         "logs": list(engine_logs), "stats": session_stats,
         "last_run": cfg.get("_ui_last_run") or {},
         "autostart": bool(cfg.get("_ui_engine_autostart")),
+        "daily_check": {
+            "enabled": bool(cfg.get("_ui_daily_check")),
+            "hour": int(cfg.get("_ui_daily_check_hour") or 3),
+            "next": _next_daily_check_ts(int(cfg.get("_ui_daily_check_hour") or 3)),
+            "last": cfg.get("_ui_daily_check_last") or {},
+        },
     }
 
 
@@ -2296,6 +2302,118 @@ def set_engine_autostart(enabled: bool = False):
         cfg["_ui_engine_autostart"] = bool(enabled)
         dump_config(cfg)
     return {"ok": True, "autostart": bool(enabled)}
+
+
+# ==================== 每天定时检查：到点看一次，有新内容就自动跑 ====================
+# 2026-11-06 用户要求：每天凌晨 3 点检查一次频道有没有新内容，有就自动跑一轮。
+# 时间按容器本地时间（NAS 是北京时间，容器 TZ=Asia/Shanghai）。
+# 注意：这只是“检查 + 触发”，真正跑采集的还是 run_all_groups；检查本身只读
+# 各频道最新一条消息的 id，不下载任何文件。
+
+def _next_daily_check_ts(hour: int) -> int:
+    """下一次每天 hour 点（容器本地时间）的时间戳。"""
+    now = time.time()
+    lt = time.localtime(now)
+    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, 0, 0, 0, 0, -1))
+    if target <= now:
+        target += 86400
+    return int(target)
+
+
+async def _channels_have_new_content() -> tuple[bool, list]:
+    """检查各频道水位线之后有没有新消息。
+    只取每个频道最新一条消息的 id 跟水位线比，不下载文件。
+    会话文件先拷一份到临时目录再连，不动正在跑的引擎（跟扫描频道同一招）。
+    """
+    cfg = load_config()
+    chats = [c for c in cfg.get("chat", [])]
+    if not chats:
+        return False, []
+    wm = {str(c.get("chat_id")): int(c.get("last_read_message_id", 0) or 0) for c in chats}
+    src = SESSION_STORE_DIR / f"{SESSION_NAME}.session"
+    tmpdir = tempfile.mkdtemp(prefix="daily_check_")
+    try:
+        shutil.copy2(src, os.path.join(tmpdir, f"{SESSION_NAME}.session"))
+        client = build_pyrogram_client(workdir=tmpdir)
+        await client.connect()
+        try:
+            detail = []
+            for c in chats:
+                cid = int(c.get("chat_id"))
+                newest = 0
+                async for msg in client.get_chat_history(cid, limit=1):
+                    newest = msg.id
+                w = wm.get(str(cid), 0)
+                detail.append({"chat_id": cid, "newest": newest, "watermark": w, "new": newest > w})
+            return any(d["new"] for d in detail), detail
+        finally:
+            await client.disconnect()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _daily_check_worker():
+    """常驻守护线程：每天到点检查一次，有新内容就自动跑。
+    面板启动时随容器启动，随容器停止；开关在配置里改了不用重启也生效。
+    """
+    print("[定时检查] 线程已启动（开关在面板里，打开后每天 03:00 检查新内容）", flush=True)
+    while True:
+        try:
+            cfg = load_config()
+            if not cfg.get("_ui_daily_check"):
+                # 没开：每小时看一眼开关，打开了不用重启也生效
+                time.sleep(3600)
+                continue
+            hour = int(cfg.get("_ui_daily_check_hour") or 3)
+            wait = _next_daily_check_ts(hour) - time.time()
+            print(f"[定时检查] 下次检查：{time.strftime('%Y-%m-%d %H:%M', time.localtime(time.time() + wait))}", flush=True)
+            time.sleep(wait)
+            cfg = load_config()
+            if not cfg.get("_ui_daily_check"):
+                continue
+            has_new, detail = asyncio.run(_channels_have_new_content())
+            with _yaml_lock:
+                _c = load_config()
+                _c["_ui_daily_check_last"] = {
+                    "at": int(time.time()),
+                    "found_new": bool(has_new),
+                    "started": False,
+                    "channels": len(detail),
+                    "new_channels": sum(1 for d in detail if d["new"]),
+                }
+                dump_config(_c)
+            if not has_new:
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 🕒 定时检查：没有新内容，继续等明天")
+                continue
+            if _start_engine(auto=True):
+                with _yaml_lock:
+                    _c = load_config()
+                    _c["_ui_daily_check_last"]["started"] = True
+                    dump_config(_c)
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] 🚀 定时检查：发现新内容，自动开始采集")
+            else:
+                engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⏸ 定时检查：发现新内容，但引擎正在跑，这次跳过")
+        except Exception as exc:
+            engine_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠ 定时检查出错：{exc}（明天到点再试）")
+            time.sleep(3600)
+
+
+@app.on_event("startup")
+def _start_daily_check_thread():
+    """面板启动时起每天定时检查的守护线程。"""
+    threading.Thread(target=_daily_check_worker, daemon=True).start()
+
+
+@app.post("/api/engine/daily_check", dependencies=[Depends(verify_auth)])
+def set_engine_daily_check(enabled: bool = False, hour: int = 3):
+    """开关「每天定时检查新内容，有就自动跑」；hour 为每天几点（容器本地时间）。"""
+    hour = max(0, min(23, int(hour)))
+    with _yaml_lock:
+        cfg = load_config()
+        cfg["_ui_daily_check"] = bool(enabled)
+        cfg["_ui_daily_check_hour"] = hour
+        dump_config(cfg)
+    return {"ok": True, "daily_check": bool(enabled), "hour": hour}
 
 
 @app.on_event("startup")

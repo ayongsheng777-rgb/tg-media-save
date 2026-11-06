@@ -914,6 +914,18 @@ body {
           频道也会跑。采过的文件不会重下、不会重复传（本地已下载的跳过，
           已上传的有去重挡着），只是第一次全量会花些时间。
         </div>
+
+        <label class="qb-check" style="margin-top:14px">
+          <input type="checkbox" v-model="cfg.daily_check" @change="toggleDailyCheck">
+          <span>每天凌晨 03:00 自动检查，有新内容就跑一轮</span>
+        </label>
+        <div class="qb-hint" style="margin-top:6px">
+          到点只看一眼：每个频道最新一条消息比水位线新，就自动跑一轮；没有新内容就不跑。
+          引擎正在跑的时候到点会跳过这一次。时间按 NAS 的北京时间（凌晨 3 点）。
+        </div>
+        <div class="qb-hint" style="margin-top:6px" v-if="cfg.daily_check">
+          <span v-if="cfg.daily_check_next">下次检查：{{ fmtRunTime(cfg.daily_check_next) }}</span><span v-if="cfg.daily_check_last && cfg.daily_check_last.at"> · 上次检查：{{ fmtRunTime(cfg.daily_check_last.at) }}，{{ cfg.daily_check_last.found_new ? (cfg.daily_check_last.started ? '有新内容，已自动跑一轮' : '有新内容，但当时引擎在跑，跳过') : '没有新内容' }}</span><span v-else> · 还没检查过</span>
+        </div>
       </section>
 
       <section class="qb-card accent-berry">
@@ -1039,7 +1051,8 @@ createApp({
         proxy_user: '', proxy_pass: '', proxy_has_pass: false,
         login_phone: '',
         // 采集记录：容器重启后 engine_logs 清空，这两项落盘保留
-        engine_autostart: false, last_run: {}
+        engine_autostart: false, last_run: {},
+        daily_check: false, daily_check_hour: 3, daily_check_next: 0, daily_check_last: {}
       },
       tgStatus: { logged_in: false, authorized: false, phone: '', engine_busy: false, user: null, login_at: 0, checking: false },
       codeSent: false, need2FA: false, tgCode: '', tg2FA: '',
@@ -1151,6 +1164,7 @@ createApp({
         chats: [], storages: [], proxy_enable: false, proxy_scheme: 'socks5',
         proxy_host: '127.0.0.1', proxy_port: 7890, proxy_user: '', proxy_pass: '', proxy_has_pass: false,
         login_phone: '', engine_autostart: false, last_run: {},
+        daily_check: false, daily_check_hour: 3, daily_check_next: 0, daily_check_last: {},
         file_name_mode: 'title_id'
       };
       this.cfg = Object.assign({}, defaults, d);
@@ -1669,6 +1683,12 @@ createApp({
         // 采集记录是落盘的，重启后仍在，顺手一并刷新
         if (d.last_run) this.cfg.last_run = d.last_run;
         if (typeof d.autostart === 'boolean') this.cfg.engine_autostart = d.autostart;
+        if (d.daily_check) {
+          this.cfg.daily_check = !!d.daily_check.enabled;
+          this.cfg.daily_check_hour = d.daily_check.hour || 3;
+          this.cfg.daily_check_next = d.daily_check.next || 0;
+          this.cfg.daily_check_last = d.daily_check.last || {};
+        }
       }
     },
     fmtRunTime(ts) {
@@ -1687,6 +1707,20 @@ createApp({
         // 回滚，别让界面显示一个根本没存下去的状态
         this.cfg.engine_autostart = !want;
         alert('保存自动补采开关失败：' + e.message);
+      }
+    },
+    async toggleDailyCheck() {
+      const want = !!this.cfg.daily_check;
+      try {
+        const r = await fetch('/api/engine/daily_check?enabled=' + want + '&hour=' + (this.cfg.daily_check_hour || 3), { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+        this.cfg.daily_check = !!d.daily_check;
+        this.cfg.daily_check_hour = d.hour || 3;
+      } catch (e) {
+        // 回滚，别让界面显示一个根本没存下去的状态
+        this.cfg.daily_check = !want;
+        alert('保存定时检查开关失败：' + e.message);
       }
     },
     async control(action) { await fetch('/api/control/' + action, { method: 'POST' }); this.fetchLogs(); },
