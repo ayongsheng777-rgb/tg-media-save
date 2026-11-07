@@ -343,7 +343,7 @@ body {
             <input type="checkbox" :value="c.chat_id" v-model="history.selected">
             <span class="t">{{ c.title || c.chat_id }}</span>
             <span class="qb-tag qb-tag-info" style="flex:none">{{ storageName(c.storage_id) }}</span>
-            <span class="qb-hint" style="flex:none">{{ c.last_read_message_id > 0 ? '已采到 ' + c.last_read_message_id : '未采集' }}</span>
+            <span class="qb-hint" style="flex:none">{{ c.last_read_message_id > 0 ? '已读到第 ' + c.last_read_message_id + ' 条消息' : '未采集' }}</span>
           </label>
           <div v-if="!boundChats.length" class="qb-hint" style="text-align:center;padding:16px 0">
             监控队列里还没有绑定网盘的频道 —— 先在下方「监控队列」给频道选一个存储目标
@@ -886,8 +886,8 @@ body {
             <div class="v">{{ cfg.last_run.mode === 'auto' ? '重启后自动' : '手动启动' }}</div>
           </div>
           <div class="qb-run-cell">
-            <div class="k">处理文件</div>
-            <div class="v">{{ cfg.last_run.downloaded || 0 }} 项</div>
+            <div class="k">下载 / 上传</div>
+            <div class="v">{{ cfg.last_run.downloaded || 0 }} / {{ cfg.last_run.uploaded || 0 }} 项</div>
           </div>
           <div class="qb-run-cell">
             <div class="k">耗时</div>

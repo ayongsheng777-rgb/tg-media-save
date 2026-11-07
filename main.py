@@ -116,7 +116,7 @@ pending_auth = {"client": None, "phone": None, "phone_code_hash": None}
 
 _config_cache = {}   # 配置解析成功后的快照，用于读失败时兜底
 engine_logs = deque(maxlen=500)
-session_stats = {"downloaded_count": 0, "last_file": "", "start_time": 0}
+session_stats = {"downloaded_count": 0, "uploaded_count": 0, "last_file": "", "start_time": 0}
 
 # ==================== 引擎日志过滤 ====================
 # 引擎上传走 `rclone copy --progress`（module/cloud_drive.py 里拼的命令），
@@ -720,8 +720,15 @@ def run_all_groups(auto: bool = False):
             for raw_line in iter(proc.stdout.readline, ""):
                 for line in filter_engine_output(raw_line, progress):
                     engine_logs.append(f"[{time.strftime('%H:%M:%S')}] {line}")
-                    if any(k in line.lower() for k in ["successfully downloaded", "下载成功", "成功下载", "upload file"]):
+                    # 2026-11-07 修正：下载与上传分开计。以前把两类日志行加进同一个数，
+                    # 一个文件下载成功打一行、上传成功又打一行，同一个文件被算了两次
+                    # （2026-11-07 早上那轮：实际下载 318、上传 317，却显示成 635）。
+                    # 下载只认下载成功行，上传只认 rclone 传完打的 success 行。
+                    _ll = line.lower()
+                    if any(k in _ll for k in ["successfully downloaded", "下载成功", "成功下载"]):
                         session_stats["downloaded_count"] += 1
+                    elif "upload file" in _ll and "success" in _ll:
+                        session_stats["uploaded_count"] += 1
             proc.wait()
 
             # 组结束后回写水位线。
@@ -760,7 +767,7 @@ def run_all_groups(auto: bool = False):
             send_notification(
                 "TG 媒体归档与同步完成",
                 [
-                    f"**本轮处理文件数**：`{session_stats['downloaded_count']}` 项",
+                    f"**本轮下载**：`{session_stats['downloaded_count']}` 项，**上传**：`{session_stats['uploaded_count']}` 项",
                     f"**总耗时**：`{elapsed}` 秒",
                     "**归档结构**：`子目录 / 频道名称 / YYYY_MM`（子目录为空时省略；月份为媒体发布月份）",
                     "\n".join(chat_lines) if chat_lines else "**频道**：无",
@@ -784,6 +791,7 @@ def run_all_groups(auto: bool = False):
                     "ended_at": int(_end),
                     "elapsed": round(_end - float(session_stats.get("start_time") or started_at), 1),
                     "downloaded": int(session_stats.get("downloaded_count", 0)),
+                    "uploaded": int(session_stats.get("uploaded_count", 0)),
                     "mode": "auto" if auto else "manual",
                     "skipped_no_watermark": auto_skipped,
                     "ok": not stop_event.is_set(),
@@ -2245,6 +2253,7 @@ def _start_engine(auto: bool = False) -> bool:
     stop_event.clear()
     engine_logs.clear()
     session_stats["downloaded_count"] = 0
+    session_stats["uploaded_count"] = 0
     session_stats["start_time"] = time.time()
     link_engine_idle()
     engine_thread = threading.Thread(target=run_all_groups, args=(auto,), daemon=True)
